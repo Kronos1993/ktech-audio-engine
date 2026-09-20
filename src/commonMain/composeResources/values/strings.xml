@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="playback_notification_channel_name">Playback</string>
+    <string name="playback_notification_title">Playback</string>
+    <string name="playback_notification_text">Loading…</string>
+    <string name="playback_shuffle_button_label">Shuffle</string>
+    <string name="playback_repeat_button_label">Repeat</string>
+</resources>

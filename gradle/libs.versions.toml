@@ -1,0 +1,35 @@
+[versions]
+agp = "9.3.1"
+android-compileSdk = "37"
+android-minSdk = "24"
+androidx-core = "1.19.0"
+composeMultiplatform = "1.11.1"
+kotlin = "2.4.10"
+kotlinx-coroutines = "1.11.0"
+kotlinx-serialization = "1.7.3"
+koin = "4.2.2"
+kermit = "2.1.0"
+media3 = "1.11.0"
+javacv = "1.5.14"
+ffmpegPlatform = "8.1.2-1.5.14"
+
+[libraries]
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "androidx-core" }
+compose-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "composeMultiplatform" }
+compose-components-resources = { module = "org.jetbrains.compose.components:components-resources", version.ref = "composeMultiplatform" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+koin-core = { module = "io.insert-koin:koin-core", version.ref = "koin" }
+koin-android = { module = "io.insert-koin:koin-android", version.ref = "koin" }
+kermit = { module = "co.touchlab:kermit", version.ref = "kermit" }
+media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
+media3-session = { module = "androidx.media3:media3-session", version.ref = "media3" }
+javacv = { module = "org.bytedeco:javacv", version.ref = "javacv" }
+ffmpeg-platform = { module = "org.bytedeco:ffmpeg-platform", version.ref = "ffmpegPlatform" }
+
+[plugins]
+androidMultiplatformLibrary = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
+composeMultiplatform = { id = "org.jetbrains.compose", version.ref = "composeMultiplatform" }
+composeCompiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlinxSerialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
