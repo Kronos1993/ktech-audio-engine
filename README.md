@@ -23,8 +23,42 @@ This repository is this library's real home as of 2026-09-20, split out of Lumin
 where it originally lived as an internal Gradle module. Lumina Sound's own consumption path is
 mid-migration to a git submodule + Gradle composite build (`includeBuild`) pointing at this repo —
 until that lands, Lumina Sound's `develop` branch may still carry its own transitional copy of this
-code from before the split. Not yet published to an external Maven repository (Maven Central /
-GitHub Packages) for use by other, unrelated repos — that's a separate, later phase.
+code from before the split.
+
+Publishing to Maven Central is wired up (the `io.github.kronos1993` namespace is verified, signing
+and Central Portal credentials are configured) but **no version has been released yet** — the
+coordinates below become resolvable once the first `vX.Y.Z` tag is pushed and its release workflow
+completes.
+
+## Installation
+
+```kotlin
+// gradle/libs.versions.toml
+[versions]
+ktechAudioEngine = "1.0.0" // use the latest released tag, without the leading "v"
+
+[libraries]
+ktech-audio-engine = { module = "io.github.kronos1993:ktech-audio-engine", version.ref = "ktechAudioEngine" }
+```
+
+```kotlin
+// build.gradle.kts
+dependencies {
+    implementation(libs.ktech.audio.engine)
+}
+```
+
+Or without a version catalog:
+
+```kotlin
+dependencies {
+    implementation("io.github.kronos1993:ktech-audio-engine:1.0.0")
+}
+```
+
+The Kotlin package (`com.kronos.ktech.audioengine`) is unrelated to the Maven coordinate above —
+Maven Central requires the group ID to match a verified namespace (`io.github.kronos1993`), which
+doesn't need to match the code's own package name.
 
 ## Requires Koin
 
