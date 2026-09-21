@@ -360,7 +360,16 @@ actual class PlayerEngine {
                 completionCallbackType = AVAudioPlayerNodeCompletionDataPlayedBack,
                 completionHandler = { _ ->
                     if (currentGeneration == scheduleGeneration) {
-                        scope.launch { advance(direction = 1) }
+                        // RepeatMode.ONE replays the same track rather than going through
+                        // advance()/nextIndex(), which has no ONE case (only ALL wraps) —
+                        // nextIndex() is shared with manual skip, where repeat-one must NOT
+                        // stop skip-to-next/previous from actually changing tracks.
+                        val state = _playbackState.value
+                        if (state.repeatMode == RepeatMode.ONE) {
+                            scope.launch { loadTrack(state.currentIndex, autoplay = true) }
+                        } else {
+                            scope.launch { advance(direction = 1) }
+                        }
                     }
                 },
             )

@@ -370,15 +370,23 @@ actual class PlayerEngine {
 
                     val frame = grabber.grabSamples()
                     if (frame == null) {
-                        // End of stream — advance according to repeat mode.
+                        // End of stream — advance according to repeat mode. RepeatMode.ONE
+                        // replays the same track rather than going through nextIndex(), which
+                        // has no ONE case (it only special-cases ALL) — nextIndex() is shared
+                        // with manual skip, where repeat-one must NOT stop skip-to-next/previous
+                        // from actually changing tracks.
                         val state = _playbackState.value
-                        val next = nextIndex(state, direction = 1)
-                        if (next == null) {
-                            stop()
+                        if (state.repeatMode == RepeatMode.ONE) {
+                            startTrack(state.currentIndex, autoplay = true)
                         } else {
-                            _positionMs.value = 0L
-                            _playbackState.update { it.copy(currentIndex = next, currentTrack = state.queue[next], positionMs = 0L) }
-                            startTrack(next, autoplay = true)
+                            val next = nextIndex(state, direction = 1)
+                            if (next == null) {
+                                stop()
+                            } else {
+                                _positionMs.value = 0L
+                                _playbackState.update { it.copy(currentIndex = next, currentTrack = state.queue[next], positionMs = 0L) }
+                                startTrack(next, autoplay = true)
+                            }
                         }
                         return@launch
                     }
