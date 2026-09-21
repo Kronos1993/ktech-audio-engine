@@ -155,15 +155,23 @@ See `PlayerEngine`'s KDoc for the full API and per-member detail.
 ## Known limitation: native now-playing integration is not portable out of the box
 
 On Desktop, macOS Control Center and Windows SMTC integration is implemented via two standalone
-native bridge modules (`macosNowPlayingBridge`, `windowsNowPlayingBridge`) that live alongside this
-module in its host repo, loaded at runtime via a **repo-relative path**. This works as long as this
-module and the two bridges stay sibling directories in whichever repo builds them together, but a
-consumer that only depends on the published `ktech-audio-engine` artifact — without also bringing
-those two bridge modules along — will not get working native now-playing integration on Desktop.
-The relevant `PlayerEngine` calls fail soft in that case (no crash; native integration simply
+native bridge modules (`macosNowPlayingBridge`, `windowsNowPlayingBridge`), built separately and
+loaded at runtime via `System.load()` on a path resolved relative to **the JVM process's current
+working directory at launch** — e.g. `macosNowPlayingBridge/build/bin/macosArm64/releaseShared/
+libmacosNowPlayingBridge.dylib`. This is a plain `java.io.File` relative-path lookup: it has nothing
+to do with where `ktech-audio-engine` itself is obtained from (a local module, a git submodule, or
+this published Maven artifact) — it only cares whether *your app's own launch directory* has those
+two bridges' compiled binaries sitting at that exact relative path underneath it.
+
+In practice, that means a consumer only gets working native now-playing on Desktop if they build
+`macosNowPlayingBridge`/`windowsNowPlayingBridge` themselves (their source isn't published or
+distributed anywhere by this library) and launch their app from a working directory where the
+compiled binaries land at the expected relative path — this library ships no such source or binaries
+itself. The relevant `PlayerEngine` calls fail soft in that case (no crash; native integration simply
 reports unavailable) rather than throwing.
 
 Fixing this for real external consumers (bundling the native binaries as classpath resources
-instead of a repo-relative path) is tracked as a separate, not-yet-started follow-on. Android and
-iOS now-playing integration are unaffected by this limitation — both use standard platform APIs
-(Media3 `MediaSessionService`, `AVAudioEngine`) with no native-bridge dependency at all.
+instead of a working-directory-relative path) is tracked as a separate, not-yet-started follow-on.
+Android and iOS now-playing integration are unaffected by this limitation — both use standard
+platform APIs (Media3 `MediaSessionService`, `AVAudioEngine`) with no native-bridge dependency at
+all.
