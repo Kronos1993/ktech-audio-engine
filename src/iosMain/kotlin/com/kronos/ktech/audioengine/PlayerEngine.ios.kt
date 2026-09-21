@@ -32,6 +32,24 @@ import platform.AVFAudio.AVAudioUnitEQ
 import platform.AVFAudio.AVAudioUnitEQFilterParameters
 import platform.AVFAudio.AVAudioUnitEQFilterTypeParametric
 import platform.AVFAudio.setActive
+import platform.AVFoundation.AVPlayer
+import platform.AVFoundation.AVPlayerItem
+import platform.AVFoundation.AVPlayerItemDidPlayToEndTimeNotification
+import platform.AVFoundation.AVPlayerItemStatusFailed
+import platform.AVFoundation.AVPlayerItemStatusReadyToPlay
+import platform.AVFoundation.AVPlayerTimeControlStatusPlaying
+import platform.AVFoundation.currentTime
+import platform.AVFoundation.duration
+import platform.AVFoundation.pause
+import platform.AVFoundation.play
+import platform.AVFoundation.replaceCurrentItemWithPlayerItem
+import platform.AVFoundation.seekToTime
+import platform.AVFoundation.setVolume
+import platform.AVFoundation.timeControlStatus
+import platform.CoreMedia.CMTimeGetSeconds
+import platform.CoreMedia.CMTimeMakeWithSeconds
+import platform.Foundation.NSNotificationCenter
+import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSURL
 import platform.MediaPlayer.MPMediaItemPropertyAlbumTitle
 import platform.MediaPlayer.MPMediaItemPropertyArtist
@@ -92,6 +110,21 @@ actual class PlayerEngine {
     // would otherwise incorrectly auto-advance past the track the user just explicitly changed
     // to. A plain pause() does not trigger completion, so this guard is scoped to track changes.
     private var scheduleGeneration = 0
+
+    // http(s) tracks (e.g. podcast episodes) are streamed with AVPlayer instead: AVAudioFile only
+    // reads local files, so the AVAudioEngine graph above cannot play them. Consequence: streamed
+    // audio bypasses the EQ node and the level tap - no equalizer and a flat audioLevel while a
+    // stream plays. Local files keep the AVAudioEngine path unchanged. AVPlayer's members
+    // (play/pause/currentTime/seekToTime/setVolume/...) are ObjC category members, i.e. top-level
+    // extension functions in Kotlin/Native that each need their own import (see the imports above).
+    private var streamPlayer: AVPlayer? = null
+    private var streamItem: AVPlayerItem? = null
+    private var streamEndObserver: Any? = null
+
+    // What the user asked for; the displayed status is derived from it plus AVPlayer's
+    // timeControlStatus so a stalled/buffering stream reads BUFFERING rather than PLAYING.
+    private var streamWantsPlayback = false
+    private var streamDurationKnown = false
 
     private val commandCenter = MPRemoteCommandCenter.sharedCommandCenter()
 
@@ -165,6 +198,11 @@ actual class PlayerEngine {
     }
 
     private fun updatePositionFromNode() {
+        val player = streamPlayer
+        if (player != null) {
+            updateFromStream(player)
+            return
+        }
         val file = audioFile ?: return
         val nodeTime = playerNode.lastRenderTime ?: return
         val playerTime = playerNode.playerTimeForNodeTime(nodeTime) ?: return
@@ -209,6 +247,13 @@ actual class PlayerEngine {
 
     actual fun play() {
         val state = _playbackState.value
+        streamPlayer?.let { player ->
+            streamWantsPlayback = true
+            player.play()
+            _playbackState.update { it.copy(status = PlaybackStatus.BUFFERING) }
+            updateNowPlayingInfo()
+            return
+        }
         if (audioFile == null && state.currentTrack != null) {
             loadTrack(state.currentIndex, autoplay = true)
             return
@@ -220,6 +265,13 @@ actual class PlayerEngine {
     }
 
     actual fun pause() {
+        streamPlayer?.let { player ->
+            streamWantsPlayback = false
+            player.pause()
+            _playbackState.update { it.copy(status = PlaybackStatus.PAUSED) }
+            updateNowPlayingInfo()
+            return
+        }
         playerNode.pause()
         _playbackState.update { it.copy(status = PlaybackStatus.PAUSED) }
         updateNowPlayingInfo()
@@ -227,6 +279,7 @@ actual class PlayerEngine {
 
     actual fun stop() {
         scheduleGeneration++
+        releaseStream()
         playerNode.stop()
         audioFile = null
         _audioLevel.value = 0f
@@ -238,6 +291,13 @@ actual class PlayerEngine {
     // Seeking on AVAudioPlayerNode means stopping and re-scheduling a fresh segment of the
     // same file starting at the target frame - there is no direct currentTime setter.
     actual fun seekTo(positionMs: Long) {
+        streamPlayer?.let { player ->
+            player.seekToTime(CMTimeMakeWithSeconds(positionMs / 1000.0, STREAM_TIMESCALE))
+            _positionMs.value = positionMs
+            _playbackState.update { it.copy(positionMs = positionMs) }
+            updateNowPlayingInfo()
+            return
+        }
         val wasPlaying = _playbackState.value.status == PlaybackStatus.PLAYING
         loadTrack(_playbackState.value.currentIndex, autoplay = wasPlaying, resumeAtMs = positionMs)
         _positionMs.value = positionMs
@@ -264,6 +324,7 @@ actual class PlayerEngine {
     actual fun setVolume(volume: Float) {
         this.volume = volume.coerceIn(0f, 1f)
         playerNode.volume = this.volume
+        streamPlayer?.setVolume(this.volume)
         _playbackState.update { it.copy(volume = this.volume) }
     }
 
@@ -291,6 +352,7 @@ actual class PlayerEngine {
         tickerJob?.cancel()
         scope.cancel()
         scheduleGeneration++
+        releaseStream()
         eqNode.removeTapOnBus(0u)
         playerNode.stop()
         engine.stop()
@@ -301,7 +363,7 @@ actual class PlayerEngine {
         val queue = state.queue
         if (queue.isEmpty()) return
 
-        val wasPlaying = state.status == PlaybackStatus.PLAYING
+        val wasPlaying = state.status == PlaybackStatus.PLAYING || state.status == PlaybackStatus.BUFFERING
         val nextIndex = nextIndex(state, direction)
         if (nextIndex == null) {
             stop()
@@ -337,8 +399,13 @@ actual class PlayerEngine {
         val currentGeneration = scheduleGeneration
         playerNode.stop()
         audioFile = null
+        releaseStream()
 
         val track = _playbackState.value.queue.getOrNull(index) ?: return
+        if (track.isRemoteStream()) {
+            loadStream(track, autoplay, resumeAtMs, currentGeneration)
+            return
+        }
         val url = NSURL(string = track.uri)
 
         runCatching {
@@ -359,18 +426,7 @@ actual class PlayerEngine {
                 atTime = null,
                 completionCallbackType = AVAudioPlayerNodeCompletionDataPlayedBack,
                 completionHandler = { _ ->
-                    if (currentGeneration == scheduleGeneration) {
-                        // RepeatMode.ONE replays the same track rather than going through
-                        // advance()/nextIndex(), which has no ONE case (only ALL wraps) —
-                        // nextIndex() is shared with manual skip, where repeat-one must NOT
-                        // stop skip-to-next/previous from actually changing tracks.
-                        val state = _playbackState.value
-                        if (state.repeatMode == RepeatMode.ONE) {
-                            scope.launch { loadTrack(state.currentIndex, autoplay = true) }
-                        } else {
-                            scope.launch { advance(direction = 1) }
-                        }
-                    }
+                    if (currentGeneration == scheduleGeneration) handleTrackEnded()
                 },
             )
             playerNode.volume = volume
@@ -389,4 +445,107 @@ actual class PlayerEngine {
             _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
         }
     }
+
+    // RepeatMode.ONE replays the same track rather than going through advance()/nextIndex(),
+    // which has no ONE case (only ALL wraps) — nextIndex() is shared with manual skip, where
+    // repeat-one must NOT stop skip-to-next/previous from actually changing tracks. Shared by the
+    // local (AVAudioPlayerNode) and streamed (AVPlayer) end-of-track callbacks.
+    private fun handleTrackEnded() {
+        val state = _playbackState.value
+        if (state.repeatMode == RepeatMode.ONE) {
+            scope.launch { loadTrack(state.currentIndex, autoplay = true) }
+        } else {
+            scope.launch { advance(direction = 1) }
+        }
+    }
+
+    private fun loadStream(track: Track, autoplay: Boolean, resumeAtMs: Long, generation: Int) {
+        // URLWithString (nullable) rather than the NSURL(string =) constructor, which Kotlin/Native
+        // types as non-null: a feed URL with an illegal character must land in ERROR, not crash.
+        val url = NSURL.URLWithString(track.uri)
+        if (url == null) {
+            _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
+            return
+        }
+        val item = AVPlayerItem(uRL = url)
+        val player = AVPlayer(playerItem = item)
+        player.setVolume(volume)
+        streamItem = item
+        streamPlayer = player
+        streamDurationKnown = false
+        streamWantsPlayback = autoplay
+        _audioLevel.value = 0f
+
+        streamEndObserver = NSNotificationCenter.defaultCenter.addObserverForName(
+            name = AVPlayerItemDidPlayToEndTimeNotification,
+            `object` = item,
+            queue = NSOperationQueue.mainQueue,
+        ) { _ ->
+            if (generation == scheduleGeneration) handleTrackEnded()
+        }
+
+        if (resumeAtMs > 0) {
+            player.seekToTime(CMTimeMakeWithSeconds(resumeAtMs / 1000.0, STREAM_TIMESCALE))
+        }
+        _playbackState.update {
+            it.copy(
+                // The feed's own duration (if the caller knew one) until AVPlayer reports the real one.
+                durationMs = track.durationMs,
+                status = if (autoplay) PlaybackStatus.BUFFERING else PlaybackStatus.PAUSED,
+            )
+        }
+        if (autoplay) player.play()
+        updateNowPlayingInfo()
+    }
+
+    // Runs from the 200 ms ticker. KVO on AVPlayerItem.status is awkward from Kotlin, so status,
+    // duration and buffering are polled here instead.
+    private fun updateFromStream(player: AVPlayer) {
+        val item = streamItem
+        if (item != null) {
+            if (item.status == AVPlayerItemStatusFailed) {
+                streamWantsPlayback = false
+                _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
+                return
+            }
+            if (!streamDurationKnown && item.status == AVPlayerItemStatusReadyToPlay) {
+                val seconds = CMTimeGetSeconds(item.duration)
+                if (!seconds.isNaN() && !seconds.isInfinite() && seconds > 0) {
+                    streamDurationKnown = true
+                    _playbackState.update { it.copy(durationMs = (seconds * 1000).toLong()) }
+                }
+            }
+        }
+        val seconds = CMTimeGetSeconds(player.currentTime())
+        if (!seconds.isNaN() && !seconds.isInfinite()) {
+            _positionMs.value = (seconds * 1000).toLong()
+        }
+        if (streamWantsPlayback) {
+            val status = if (player.timeControlStatus == AVPlayerTimeControlStatusPlaying) {
+                PlaybackStatus.PLAYING
+            } else {
+                PlaybackStatus.BUFFERING
+            }
+            if (_playbackState.value.status != status) {
+                _playbackState.update { it.copy(status = status) }
+            }
+        }
+    }
+
+    private fun releaseStream() {
+        streamEndObserver?.let { NSNotificationCenter.defaultCenter.removeObserver(it) }
+        streamEndObserver = null
+        streamPlayer?.pause()
+        streamPlayer?.replaceCurrentItemWithPlayerItem(null)
+        streamPlayer = null
+        streamItem = null
+        streamWantsPlayback = false
+        streamDurationKnown = false
+    }
+
+    private fun Track.isRemoteStream(): Boolean =
+        uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)
 }
+
+// CMTime timescale for seeks: 1000 = millisecond resolution.
+private const val STREAM_TIMESCALE = 1000
