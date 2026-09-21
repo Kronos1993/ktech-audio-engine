@@ -23,11 +23,6 @@ implementations are validated on real devices.
 this library's first real-world consumer — currently mid-migration to consuming it via a git
 submodule + Gradle composite build (`includeBuild`) rather than an in-repo module.
 
-Publishing to Maven Central is wired up (the `io.github.kronos1993` namespace is verified, signing
-and Central Portal credentials are configured) but **no version has been released yet** — the
-coordinates below become resolvable once the first `vX.Y.Z` tag is pushed and its release workflow
-completes.
-
 ## Installation
 
 ```kotlin
