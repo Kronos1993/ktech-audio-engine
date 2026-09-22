@@ -406,7 +406,22 @@ actual class PlayerEngine {
             loadStream(track, autoplay, resumeAtMs, currentGeneration)
             return
         }
-        val url = NSURL(string = track.uri)
+        // track.uri here is either a proper URL string (e.g. an iOS ipod-library:// asset URL
+        // for a local-library track) or a bare filesystem path (e.g. a downloaded podcast
+        // episode's local file). NSURL(string:)/URLWithString expect percent-encoded URL syntax
+        // and mishandle a raw path containing spaces/unicode - fileURLWithPath builds a correct
+        // file:// URL from the literal path instead. NSURL(string:) is also typed non-null by
+        // Kotlin/Native despite the underlying ObjC initializer returning nil for a malformed
+        // string, so any non-URL uri here previously crashed with an NPE right at construction -
+        // same class of gotcha loadStream() below already avoids via URLWithString's nullable form.
+        val url = if (track.uri.contains("://")) {
+            NSURL.URLWithString(track.uri) ?: run {
+                _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
+                return
+            }
+        } else {
+            NSURL.fileURLWithPath(track.uri)
+        }
 
         runCatching {
             val file = AVAudioFile(forReading = url, error = null)
