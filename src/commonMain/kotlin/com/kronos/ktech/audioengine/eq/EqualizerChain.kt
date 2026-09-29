@@ -33,6 +33,11 @@ class EqualizerChain {
             filters[i].updateCoefficients(EqualizerBands.FREQUENCIES_HZ[i], sampleRateHz, gainsDb[i])
             value = filters[i].process(value)
         }
+        if (!value.isFinite()) {
+            // Never throw from the audio thread: drop the diverged filter state and pass through.
+            reset()
+            return input
+        }
         return value.roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
     }
 

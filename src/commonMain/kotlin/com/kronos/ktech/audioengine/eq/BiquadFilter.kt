@@ -32,8 +32,9 @@ class BiquadFilter(private val q: Float = 1.0f) {
         lastSampleRateHz = sampleRateHz
         lastGainDb = gainDb
 
-        if (gainDb == 0f) {
-            // Identity filter - avoids unnecessary floating-point drift when a band is flat.
+        if (gainDb == 0f || sampleRateHz <= 0 || frequencyHz >= NYQUIST_GUARD_RATIO * sampleRateHz) {
+            // Identity filter - a flat band needs no processing, and a band at/near Nyquist
+            // (w0 >= pi) yields an unstable filter that diverges to Inf/NaN.
             b0 = 1f
             b1 = 0f
             b2 = 0f
@@ -65,5 +66,11 @@ class BiquadFilter(private val q: Float = 1.0f) {
     fun reset() {
         z1 = 0f
         z2 = 0f
+    }
+
+    private companion object {
+        // Bands at or above this fraction of the sample rate are bypassed; the stream has no
+        // content there, and the peaking formula becomes unstable as w0 approaches pi.
+        const val NYQUIST_GUARD_RATIO = 0.45f
     }
 }
