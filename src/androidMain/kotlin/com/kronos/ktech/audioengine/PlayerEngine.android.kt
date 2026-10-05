@@ -7,14 +7,17 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.audiofx.Visualizer
 import android.net.Uri
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.PlayerMessage
 import com.kronos.ktech.audioengine.eq.LuminaEqualizerAudioProcessor
 import com.kronos.ktech.audioengine.domain.AudioOutputDevice
 import com.kronos.ktech.audioengine.domain.AudioOutputDeviceType
@@ -37,6 +40,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 private const val TAG = "PlayerEngine"
+private const val FADE_STEP_MS = 50L
 
 // Deliberately excludes types with no meaningful selectable-music-output identity
 // (TYPE_BUILTIN_EARPIECE, TYPE_TELEPHONY, TYPE_FM, etc.) that GET_DEVICES_OUTPUTS can
@@ -105,6 +109,24 @@ actual class PlayerEngine(
         }
 
     private var queueTracks: List<Track> = emptyList()
+    private var volume: Float = 1f
+    private var crossfadeMs: Long = 0L
+
+    // Crossfade: the main exoPlayer (MediaSession, notification, ticker, visualizer) jumps to the
+    // next item at the fade point and ramps up, while this headless helper plays the outgoing
+    // item's tail and ramps down. Built lazily, only once crossfade is first used.
+    private val fadeOutEqualizer = LuminaEqualizerAudioProcessor()
+    private var fadeOutPlayer: ExoPlayer? = null
+    private var preferredAudioDevice: AudioDeviceInfo? = null
+
+    // The fade prepared for the current item: helper pre-loaded at the fade point, a PlayerMessage
+    // armed to start it.
+    private var plannedFadeIndex: Int = C.INDEX_UNSET
+    private var plannedFadeMessage: PlayerMessage? = null
+    private var fadeJob: Job? = null
+
+    // Our own seekToNextMediaItem() at the fade point must not count as a user seek.
+    private var ignoreNextSeekDiscontinuity = false
     private var visualizer: Visualizer? = null
     private var visualizerSessionId: Int = 0
     private var tickerJob: Job? = null
@@ -121,9 +143,31 @@ actual class PlayerEngine(
         refreshAvailableOutputDevices()
         exoPlayer.addListener(
             object : Player.Listener {
-                override fun onPlaybackStateChanged(playbackState: Int) = updateStatus()
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (playbackState == Player.STATE_IDLE || playbackState == Player.STATE_ENDED) cancelCrossfade()
+                    updateStatus()
+                }
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) = updateStatus()
+
+                // MediaSession/notification commands reach exoPlayer directly, not through this
+                // class - keep the fade-out helper in step with them here.
+                override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                    fadeOutPlayer?.takeIf { fadeJob != null }?.playWhenReady = playWhenReady
+                }
+
+                override fun onPositionDiscontinuity(
+                    oldPosition: Player.PositionInfo,
+                    newPosition: Player.PositionInfo,
+                    reason: Int,
+                ) {
+                    if (reason != Player.DISCONTINUITY_REASON_SEEK) return
+                    if (ignoreNextSeekDiscontinuity) {
+                        ignoreNextSeekDiscontinuity = false
+                    } else {
+                        cancelCrossfade()
+                    }
+                }
 
                 override fun onPlayerError(error: PlaybackException) {
                     _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
@@ -154,6 +198,7 @@ actual class PlayerEngine(
                         }
                     }
                     ensureVisualizer()
+                    planCrossfadeIfDue()
                     delay(200)
                 }
             }
@@ -243,6 +288,7 @@ actual class PlayerEngine(
         tracks: List<Track>,
         startIndex: Int,
     ) {
+        cancelCrossfade()
         queueTracks = tracks
         val mediaItems =
             tracks.map { track ->
@@ -326,22 +372,26 @@ actual class PlayerEngine(
     }
 
     actual fun stop() {
+        cancelCrossfade()
         exoPlayer.stop()
         _audioLevel.value = 0f
     }
 
     actual fun seekTo(positionMs: Long) {
+        cancelCrossfade()
         reprepareIfIdle()
         exoPlayer.seekTo(positionMs)
         _positionMs.value = positionMs
     }
 
     actual fun skipNext() {
+        cancelCrossfade()
         reprepareIfIdle()
         exoPlayer.seekToNext()
     }
 
     actual fun skipPrevious() {
+        cancelCrossfade()
         reprepareIfIdle()
         exoPlayer.seekToPrevious()
     }
@@ -362,16 +412,20 @@ actual class PlayerEngine(
     }
 
     actual fun setVolume(volume: Float) {
-        exoPlayer.volume = volume.coerceIn(0f, 1f)
-        _playbackState.update { it.copy(volume = volume.coerceIn(0f, 1f)) }
+        this.volume = volume.coerceIn(0f, 1f)
+        // During a fade the ramp applies the new volume on its next step.
+        if (fadeJob == null) exoPlayer.volume = this.volume
+        _playbackState.update { it.copy(volume = this.volume) }
     }
 
     @OptIn(UnstableApi::class)
     actual fun selectOutputDevice(deviceId: String?) {
+        cancelCrossfade()
         val device = deviceId?.let { id -> _availableOutputDevices.value.firstOrNull { it.id == id } }
-        exoPlayer.setPreferredAudioDevice(
-            deviceId?.let { id -> audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id.toString() == id } },
-        )
+        preferredAudioDevice =
+            deviceId?.let { id -> audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id.toString() == id } }
+        exoPlayer.setPreferredAudioDevice(preferredAudioDevice)
+        fadeOutPlayer?.setPreferredAudioDevice(preferredAudioDevice)
         // AudioTrack.setPreferredDevice() on an already-open, actively-routed track is
         // best-effort and not reliably honored by the OS while Bluetooth A2DP already owns the
         // route (confirmed real-device: switching to a non-Bluetooth device silently failed on
@@ -389,10 +443,109 @@ actual class PlayerEngine(
 
     actual fun setEqualizerEnabled(enabled: Boolean) {
         equalizerAudioProcessor.setEnabled(enabled)
+        fadeOutEqualizer.setEnabled(enabled)
     }
 
     actual fun setEqualizerBands(gainsDb: FloatArray) {
         equalizerAudioProcessor.setBandGains(gainsDb)
+        fadeOutEqualizer.setBandGains(gainsDb)
+    }
+
+    actual fun setCrossfadeDuration(durationMs: Long) {
+        crossfadeMs = durationMs.coerceAtLeast(0L)
+        if (crossfadeMs == 0L) cancelCrossfade()
+    }
+
+    // Runs from the 200 ms ticker: shortly before the fade point, pre-loads the helper with the
+    // current item paused at that point (so starting it costs no buffering) and arms a
+    // PlayerMessage that fires exactly there.
+    private fun planCrossfadeIfDue() {
+        if (crossfadeMs == 0L || fadeJob != null || !exoPlayer.isPlaying) return
+        val index = exoPlayer.currentMediaItemIndex
+        if (plannedFadeIndex != C.INDEX_UNSET) {
+            if (plannedFadeIndex != index) cancelCrossfade()
+            return
+        }
+        val durationMs = exoPlayer.duration.takeIf { it > 0 } ?: return
+        val remainingMs = durationMs - exoPlayer.currentPosition
+        val nextIndex = exoPlayer.nextMediaItemIndex
+        val windowMs = Crossfade.windowMs(
+            requestedMs = crossfadeMs,
+            outgoing = queueTracks.getOrNull(index),
+            outgoingIndex = index,
+            outgoingDurationMs = durationMs,
+            incoming = queueTracks.getOrNull(nextIndex),
+            incomingIndex = nextIndex,
+        )
+        if (windowMs == 0L || remainingMs > windowMs + Crossfade.PREPARE_LEAD_MS || remainingMs <= windowMs) return
+
+        val fadePointMs = durationMs - windowMs
+        val helper = fadeOutPlayer ?: buildFadeOutPlayer().also { fadeOutPlayer = it }
+        val item = exoPlayer.currentMediaItem ?: return
+        helper.playWhenReady = false
+        helper.setMediaItem(item, fadePointMs)
+        helper.prepare()
+        plannedFadeIndex = index
+        plannedFadeMessage = exoPlayer
+            .createMessage { _, _ -> startCrossfade(index, windowMs) }
+            .setLooper(Looper.getMainLooper())
+            .setPosition(index, fadePointMs)
+            .setDeleteAfterDelivery(true)
+            .send()
+    }
+
+    private fun buildFadeOutPlayer(): ExoPlayer = ExoPlayer
+        .Builder(appContext)
+        .setRenderersFactory(LuminaRenderersFactory(appContext, fadeOutEqualizer))
+        .build()
+        .also { it.setPreferredAudioDevice(preferredAudioDevice) }
+
+    private fun startCrossfade(index: Int, windowMs: Long) {
+        val helper = fadeOutPlayer
+        val nextIndex = exoPlayer.nextMediaItemIndex
+        if (helper == null || index != plannedFadeIndex || index != exoPlayer.currentMediaItemIndex ||
+            nextIndex == C.INDEX_UNSET || nextIndex == index
+        ) {
+            cancelCrossfade()
+            return
+        }
+        plannedFadeMessage = null
+        helper.volume = volume
+        helper.play()
+        exoPlayer.volume = 0f
+        ignoreNextSeekDiscontinuity = true
+        exoPlayer.seekToNextMediaItem()
+        fadeJob = scope.launch {
+            var elapsedMs = 0L
+            while (isActive && elapsedMs < windowMs) {
+                val progress = elapsedMs.toFloat() / windowMs
+                exoPlayer.volume = volume * Crossfade.fadeInGain(progress)
+                helper.volume = volume * Crossfade.fadeOutGain(progress)
+                delay(FADE_STEP_MS)
+                if (exoPlayer.isPlaying) elapsedMs += FADE_STEP_MS
+            }
+            finishCrossfade()
+        }
+    }
+
+    private fun finishCrossfade() {
+        fadeJob = null
+        plannedFadeIndex = C.INDEX_UNSET
+        fadeOutPlayer?.let {
+            it.stop()
+            it.clearMediaItems()
+        }
+        exoPlayer.volume = volume
+    }
+
+    private fun cancelCrossfade() {
+        plannedFadeMessage?.cancel()
+        plannedFadeMessage = null
+        val job = fadeJob
+        fadeJob = null
+        job?.cancel()
+        if (job != null || plannedFadeIndex != C.INDEX_UNSET) finishCrossfade()
+        ignoreNextSeekDiscontinuity = false
     }
 
     actual fun release() {
@@ -400,6 +553,8 @@ actual class PlayerEngine(
         tickerJob?.cancel()
         scope.cancel()
         visualizer?.release()
+        cancelCrossfade()
+        fadeOutPlayer?.release()
         exoPlayer.release()
         runCatching { appContext.stopService(Intent(appContext, PlaybackService::class.java)) }
     }

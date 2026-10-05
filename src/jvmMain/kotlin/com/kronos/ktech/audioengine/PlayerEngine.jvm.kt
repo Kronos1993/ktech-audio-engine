@@ -80,6 +80,8 @@ actual class PlayerEngine {
 
     @Volatile private var pendingSeekMs: Long? = null
 
+    @Volatile private var crossfadeMs: Long = 0L
+
     // One EqualizerChain per audio channel of the CURRENT track (rebuilt in startTrack() once
     // grabber.audioChannels is known) - interleaved multi-channel PCM would otherwise corrupt
     // a single shared filter's internal state by alternating unrelated channels' samples
@@ -235,6 +237,10 @@ actual class PlayerEngine {
         equalizerChannels.forEach { it.setBandGains(equalizerGainsDb) }
     }
 
+    actual fun setCrossfadeDuration(durationMs: Long) {
+        crossfadeMs = durationMs.coerceAtLeast(0L)
+    }
+
     actual fun release() {
         playbackJob?.cancel()
         playbackJob = null
@@ -302,8 +308,16 @@ actual class PlayerEngine {
             previousJob?.cancelAndJoin()
             closeLine()
 
-            val grabber = FFmpegFrameGrabber(resolveMediaPath(track.uri))
+            var source: PcmSource? = null
+            // The next track while a crossfade is in progress; promoted to source when the
+            // outgoing one ends or the fade completes.
+            var incoming: PcmSource? = null
+            var fadeTotalFrames = 0L
+            var fadeDoneFrames = 0L
+            // The source whose fade-or-cut decision was already made (decided once per track).
+            var fadeDecidedFor: PcmSource? = null
             try {
+                val grabber = FFmpegFrameGrabber(resolveMediaPath(track.uri))
                 // Must be set BEFORE start() - FFmpegFrameGrabber only wires ffmpeg's
                 // swresample filter into the decode pipeline at start() time; setting
                 // sampleRate afterward has no effect on already-decoding frames. When a
@@ -313,8 +327,12 @@ actual class PlayerEngine {
                 // instead of opening at the source file's own native rate and having
                 // javax.sound.sampled reject it as an unsupported format for that mixer.
                 preferredSampleRateFor(currentMixerInfo)?.let { grabber.sampleRate = it }
+                source = PcmSource(index, grabber)
                 grabber.start()
-                equalizerChannels = List(grabber.audioChannels) {
+                val sampleRate = grabber.sampleRate
+                val channels = grabber.audioChannels
+                source.configure(sampleRate, channels)
+                equalizerChannels = List(channels) {
                     EqualizerChain().also { chain ->
                         chain.setEnabled(equalizerEnabled)
                         chain.setBandGains(equalizerGainsDb)
@@ -332,13 +350,15 @@ actual class PlayerEngine {
                 // immediately after starting a track that was actually already playing.
                 _playbackState.update {
                     it.copy(
-                        durationMs = grabber.lengthInTime / 1000,
+                        durationMs = source.durationMs,
                         status = if (!isPaused) PlaybackStatus.PLAYING else PlaybackStatus.PAUSED,
                     )
                 }
                 syncNowPlaying()
 
-                val format = AudioFormat(grabber.sampleRate.toFloat(), 16, grabber.audioChannels, true, false)
+                // The line stays open for every natural track change below (gapless); later
+                // tracks are decoded straight to this format. Only startTrack() reopens it.
+                val format = AudioFormat(sampleRate.toFloat(), 16, channels, true, false)
                 val line = openLine(format)
                 currentLine = line
                 applyVolume(line)
@@ -348,8 +368,15 @@ actual class PlayerEngine {
                 while (isActive) {
                     val seekMs = pendingSeekMs
                     if (seekMs != null) {
-                        grabber.timestamp = seekMs * 1000L
                         pendingSeekMs = null
+                        // A seek during a fade belongs to the incoming track (already current).
+                        incoming?.let { next ->
+                            source?.close()
+                            source = next
+                            incoming = null
+                        }
+                        source!!.seek(seekMs)
+                        fadeDecidedFor = null
                         _positionMs.value = seekMs
                         _playbackState.update { it.copy(positionMs = seekMs) }
                     }
@@ -368,53 +395,73 @@ actual class PlayerEngine {
                     }
                     if (!line.isRunning) line.start()
 
-                    val frame = grabber.grabSamples()
-                    if (frame == null) {
-                        // End of stream — advance according to repeat mode. RepeatMode.ONE
+                    val outgoing = source!!
+                    if (incoming == null && fadeDecidedFor !== outgoing && isInCrossfadeWindow(outgoing)) {
+                        fadeDecidedFor = outgoing
+                        incoming = beginCrossfade(outgoing, sampleRate, channels)
+                        if (incoming != null) {
+                            val windowMs = (outgoing.durationMs - outgoing.positionMs).coerceAtLeast(1L)
+                            fadeTotalFrames = windowMs * sampleRate / 1000
+                            fadeDoneFrames = 0L
+                        }
+                    }
+
+                    var samples = outgoing.next()
+                    if (samples == null) {
+                        outgoing.close()
+                        val next = incoming
+                        if (next != null) {
+                            source = next
+                            incoming = null
+                            continue
+                        }
+                        // End of stream: continue on the same open line. RepeatMode.ONE
                         // replays the same track rather than going through nextIndex(), which
                         // has no ONE case (it only special-cases ALL) — nextIndex() is shared
                         // with manual skip, where repeat-one must NOT stop skip-to-next/previous
                         // from actually changing tracks.
                         val state = _playbackState.value
-                        if (state.repeatMode == RepeatMode.ONE) {
-                            startTrack(state.currentIndex, autoplay = true)
-                        } else {
-                            val next = nextIndex(state, direction = 1)
-                            if (next == null) {
-                                stop()
-                            } else {
-                                _positionMs.value = 0L
-                                _playbackState.update { it.copy(currentIndex = next, currentTrack = state.queue[next], positionMs = 0L) }
-                                startTrack(next, autoplay = true)
-                            }
+                        val nextIndex = if (state.repeatMode == RepeatMode.ONE) outgoing.index else nextIndex(state, direction = 1)
+                        if (nextIndex == null) {
+                            source = null
+                            stop()
+                            return@launch
                         }
-                        return@launch
+                        source = openNextSource(nextIndex, sampleRate, channels)
+                        continue
                     }
 
-                    val samples = frame.samples?.getOrNull(0) as? ShortBuffer ?: continue
-                    val shortArray = ShortArray(samples.remaining())
-                    samples.get(shortArray)
+                    val fading = incoming
+                    if (fading != null) {
+                        samples = mix(samples, fading.take(samples.size), channels, fadeDoneFrames, fadeTotalFrames)
+                        fadeDoneFrames += samples.size / channels
+                    }
 
                     if (equalizerChannels.isNotEmpty()) {
-                        val sampleRateHz = grabber.sampleRate
                         val channelCount = equalizerChannels.size
-                        for (i in shortArray.indices) {
-                            shortArray[i] = equalizerChannels[i % channelCount].processSample(sampleRateHz, shortArray[i])
+                        for (i in samples.indices) {
+                            samples[i] = equalizerChannels[i % channelCount].processSample(sampleRate, samples[i])
                         }
                     }
 
                     var peak = 0
-                    for (s in shortArray) {
+                    for (s in samples) {
                         val a = abs(s.toInt())
                         if (a > peak) peak = a
                     }
                     _audioLevel.value = (peak / Short.MAX_VALUE.toFloat()).coerceIn(0f, 1f)
 
-                    val byteBuffer = ByteBuffer.allocate(shortArray.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-                    byteBuffer.asShortBuffer().put(shortArray)
+                    val byteBuffer = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    byteBuffer.asShortBuffer().put(samples)
                     line.write(byteBuffer.array(), 0, byteBuffer.array().size)
 
-                    _positionMs.value = frame.timestamp / 1000
+                    if (fading != null && fadeDoneFrames >= fadeTotalFrames) {
+                        // The outgoing track is silent from here on: drop it.
+                        outgoing.close()
+                        source = fading
+                        incoming = null
+                    }
+                    _positionMs.value = (incoming ?: source)!!.positionMs
 
                     // Now Playing position sync is throttled to ~1/sec — pushing it on
                     // every audio frame (tens of times/sec) would be wasteful native-call
@@ -428,10 +475,78 @@ actual class PlayerEngine {
             } catch (t: Throwable) {
                 _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
             } finally {
-                runCatching { grabber.stop() }
-                runCatching { grabber.release() }
+                source?.close()
+                incoming?.close()
             }
         }
+    }
+
+    // Opens the queue item at [index] decoded to the open line's format (swresample converts any
+    // rate/channel difference), and makes it the current track.
+    private fun openNextSource(index: Int, sampleRate: Int, channels: Int): PcmSource {
+        val state = _playbackState.value
+        val track = state.queue[index]
+        val grabber = FFmpegFrameGrabber(resolveMediaPath(track.uri))
+        grabber.sampleRate = sampleRate
+        grabber.audioChannels = channels
+        val source = PcmSource(index, grabber)
+        try {
+            grabber.start()
+        } catch (t: Throwable) {
+            source.close()
+            throw t
+        }
+        source.configure(sampleRate, channels)
+        _positionMs.value = 0L
+        _playbackState.update {
+            it.copy(currentIndex = index, currentTrack = track, positionMs = 0L, durationMs = source.durationMs)
+        }
+        syncNowPlaying()
+        return source
+    }
+
+    private fun isInCrossfadeWindow(outgoing: PcmSource): Boolean {
+        val durationMs = outgoing.durationMs
+        if (crossfadeMs == 0L || durationMs <= 0) return false
+        return durationMs - outgoing.positionMs <= minOf(crossfadeMs, durationMs / 2)
+    }
+
+    // Opens the next track for a crossfade, or returns null when this transition must stay a
+    // plain gapless cut (see Crossfade.windowMs).
+    private fun beginCrossfade(outgoing: PcmSource, sampleRate: Int, channels: Int): PcmSource? {
+        val durationMs = outgoing.durationMs
+        val remainingMs = durationMs - outgoing.positionMs
+        val state = _playbackState.value
+        if (state.repeatMode == RepeatMode.ONE) return null
+        val nextIndex = nextIndex(state, direction = 1) ?: return null
+        val windowMs = Crossfade.windowMs(
+            requestedMs = crossfadeMs,
+            outgoing = state.queue.getOrNull(outgoing.index),
+            outgoingIndex = outgoing.index,
+            outgoingDurationMs = durationMs,
+            incoming = state.queue.getOrNull(nextIndex),
+            incomingIndex = nextIndex,
+        )
+        if (windowMs == 0L || remainingMs > windowMs) return null
+        return runCatching { openNextSource(nextIndex, sampleRate, channels) }.getOrNull()
+    }
+
+    // Equal-power mix of one outgoing chunk with the same number of incoming samples.
+    private fun mix(outgoing: ShortArray, incoming: ShortArray, channels: Int, doneFrames: Long, totalFrames: Long): ShortArray {
+        val out = ShortArray(outgoing.size)
+        val frames = outgoing.size / channels
+        for (f in 0 until frames) {
+            val progress = ((doneFrames + f).toFloat() / totalFrames).coerceIn(0f, 1f)
+            val outGain = Crossfade.fadeOutGain(progress)
+            val inGain = Crossfade.fadeInGain(progress)
+            for (c in 0 until channels) {
+                val i = f * channels + c
+                val incomingSample = if (i < incoming.size) incoming[i] else 0
+                val mixed = outgoing[i] * outGain + incomingSample * inGain
+                out[i] = mixed.toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+            }
+        }
+        return out
     }
 
     // DeviceMusicScanner.jvm.kt hands us File.toURI() strings (percent-encoded, e.g. spaces
@@ -547,5 +662,78 @@ actual class PlayerEngine {
             runCatching { line.close() }
         }
         currentLine = null
+    }
+}
+
+// One decoded queue item, read as interleaved 16-bit PCM. Position is derived from the samples
+// handed out, so it stays exact when chunks are split across a crossfade mix.
+private class PcmSource(
+    val index: Int,
+    private val grabber: FFmpegFrameGrabber,
+) {
+    private var sampleRate = 1
+    private var channels = 1
+    private var buffer = ShortArray(0)
+    private var offset = 0
+    private var startMs = 0L
+    private var consumedFrames = 0L
+
+    val durationMs: Long get() = grabber.lengthInTime / 1000
+
+    val positionMs: Long get() = startMs + consumedFrames * 1000 / sampleRate
+
+    fun configure(sampleRate: Int, channels: Int) {
+        this.sampleRate = sampleRate.coerceAtLeast(1)
+        this.channels = channels.coerceAtLeast(1)
+    }
+
+    fun seek(positionMs: Long) {
+        grabber.timestamp = positionMs * 1000L
+        buffer = ShortArray(0)
+        offset = 0
+        startMs = positionMs
+        consumedFrames = 0L
+    }
+
+    // The next chunk of samples (leftover from take() first), or null at end of stream.
+    fun next(): ShortArray? {
+        val chunk = if (offset < buffer.size) {
+            buffer.copyOfRange(offset, buffer.size).also { offset = buffer.size }
+        } else {
+            decode() ?: return null
+        }
+        consumedFrames += chunk.size / channels
+        return chunk
+    }
+
+    // Exactly [count] samples, fewer only at end of stream.
+    fun take(count: Int): ShortArray {
+        val out = ShortArray(count)
+        var filled = 0
+        while (filled < count) {
+            if (offset >= buffer.size) {
+                buffer = decode() ?: break
+                offset = 0
+            }
+            val n = minOf(count - filled, buffer.size - offset)
+            buffer.copyInto(out, filled, offset, offset + n)
+            offset += n
+            filled += n
+        }
+        consumedFrames += filled / channels
+        return if (filled == count) out else out.copyOf(filled)
+    }
+
+    private fun decode(): ShortArray? {
+        while (true) {
+            val frame = grabber.grabSamples() ?: return null
+            val samples = frame.samples?.getOrNull(0) as? ShortBuffer ?: continue
+            return ShortArray(samples.remaining()).also { samples.get(it) }
+        }
+    }
+
+    fun close() {
+        runCatching { grabber.stop() }
+        runCatching { grabber.release() }
     }
 }

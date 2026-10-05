@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
 import platform.AVFAudio.AVAudioEngine
 import platform.AVFAudio.AVAudioFile
 import platform.AVFAudio.AVAudioFramePosition
+import platform.AVFAudio.AVAudioMixerNode
 import platform.AVFAudio.AVAudioPlayerNode
 import platform.AVFAudio.AVAudioPlayerNodeCompletionDataPlayedBack
 import platform.AVFAudio.AVAudioSession
@@ -88,7 +89,12 @@ actual class PlayerEngine {
     actual val outputSelectionMode: OutputSelectionMode = OutputSelectionMode.SYSTEM_PICKER
 
     private val engine = AVAudioEngine()
-    private val playerNode = AVAudioPlayerNode()
+
+    // Two player nodes feed one submixer so a crossfade can overlap two tracks. playerNode is
+    // always the current track's node; the nodes swap roles when a fade starts.
+    private var playerNode = AVAudioPlayerNode()
+    private var idleNode = AVAudioPlayerNode()
+    private val submixer = AVAudioMixerNode()
     private val eqNode = AVAudioUnitEQ(numberOfBands = EqualizerBands.COUNT.toULong())
 
     private var audioFile: AVAudioFile? = null
@@ -102,6 +108,20 @@ actual class PlayerEngine {
     // "current time" recipe - confirmed against multiple independent AVFoundation references,
     // not derived from a single product's implementation).
     private var segmentStartFrame: AVAudioFramePosition = 0
+
+    // Node time already spent on earlier segments of playerNode: a gapless next track is
+    // scheduled on the same node, whose sample time keeps counting across segments.
+    private var nodeOffsetSeconds = 0.0
+
+    private var crossfadeMs = 0L
+
+    // Set once per track when the end-of-track transition has been decided: a pre-scheduled
+    // gapless next (gaplessNext) or a fade to start at a position (plannedFade).
+    private var transitionPrepared = false
+    private var gaplessNext: GaplessNext? = null
+    private var plannedFade: PlannedFade? = null
+    private var fadeJob: Job? = null
+    private var fadeOutNode: AVAudioPlayerNode? = null
 
     // Bumped on every loadTrack()/stop() call. A completion callback captures the generation at
     // schedule time and only advances if it's still current when it fires - guards against a
@@ -133,8 +153,12 @@ actual class PlayerEngine {
         AVAudioSession.sharedInstance().setActive(true, error = null)
 
         engine.attachNode(playerNode)
+        engine.attachNode(idleNode)
+        engine.attachNode(submixer)
         engine.attachNode(eqNode)
-        engine.connect(playerNode, to = eqNode, format = null)
+        engine.connect(playerNode, to = submixer, fromBus = 0u, toBus = 0u, format = null)
+        engine.connect(idleNode, to = submixer, fromBus = 0u, toBus = 1u, format = null)
+        engine.connect(submixer, to = eqNode, format = null)
         engine.connect(eqNode, to = engine.mainMixerNode, format = null)
         configureEqualizerBands()
         eqNode.bypass = true
@@ -162,6 +186,7 @@ actual class PlayerEngine {
         tickerJob = scope.launch {
             while (isActive) {
                 updatePositionFromNode()
+                prepareTransitionIfDue()
                 updateNowPlayingInfo()
                 delay(200)
             }
@@ -206,10 +231,11 @@ actual class PlayerEngine {
         val file = audioFile ?: return
         val nodeTime = playerNode.lastRenderTime ?: return
         val playerTime = playerNode.playerTimeForNodeTime(nodeTime) ?: return
-        val currentFrame = segmentStartFrame + playerTime.sampleTime
-        val sampleRate = file.processingFormat.sampleRate
-        if (sampleRate > 0) {
-            _positionMs.value = ((currentFrame.toDouble() / sampleRate) * 1000).toLong()
+        val fileRate = file.processingFormat.sampleRate
+        val nodeRate = playerTime.sampleRate
+        if (fileRate > 0 && nodeRate > 0) {
+            val seconds = segmentStartFrame / fileRate + playerTime.sampleTime / nodeRate - nodeOffsetSeconds
+            _positionMs.value = (seconds.coerceAtLeast(0.0) * 1000).toLong()
         }
     }
 
@@ -260,6 +286,7 @@ actual class PlayerEngine {
         }
         if (!engine.running) engine.startAndReturnError(outError = null)
         playerNode.play()
+        fadeOutNode?.play()
         _playbackState.update { it.copy(status = PlaybackStatus.PLAYING) }
         updateNowPlayingInfo()
     }
@@ -273,12 +300,15 @@ actual class PlayerEngine {
             return
         }
         playerNode.pause()
+        fadeOutNode?.pause()
         _playbackState.update { it.copy(status = PlaybackStatus.PAUSED) }
         updateNowPlayingInfo()
     }
 
     actual fun stop() {
         scheduleGeneration++
+        cancelCrossfade()
+        resetTransition()
         releaseStream()
         playerNode.stop()
         audioFile = null
@@ -323,7 +353,8 @@ actual class PlayerEngine {
 
     actual fun setVolume(volume: Float) {
         this.volume = volume.coerceIn(0f, 1f)
-        playerNode.volume = this.volume
+        // During a fade the ramp applies the new volume on its next step.
+        if (fadeJob == null) playerNode.volume = this.volume
         streamPlayer?.setVolume(this.volume)
         _playbackState.update { it.copy(volume = this.volume) }
     }
@@ -344,6 +375,11 @@ actual class PlayerEngine {
         }
     }
 
+    actual fun setCrossfadeDuration(durationMs: Long) {
+        crossfadeMs = durationMs.coerceAtLeast(0L)
+        if (crossfadeMs == 0L) plannedFade = null
+    }
+
     actual fun release() {
         commandCenter.playCommand.removeTarget(null)
         commandCenter.pauseCommand.removeTarget(null)
@@ -352,9 +388,11 @@ actual class PlayerEngine {
         tickerJob?.cancel()
         scope.cancel()
         scheduleGeneration++
+        cancelCrossfade()
         releaseStream()
         eqNode.removeTapOnBus(0u)
         playerNode.stop()
+        idleNode.stop()
         engine.stop()
     }
 
@@ -397,8 +435,11 @@ actual class PlayerEngine {
     private fun loadTrack(index: Int, autoplay: Boolean, resumeAtMs: Long = 0L) {
         scheduleGeneration++
         val currentGeneration = scheduleGeneration
+        cancelCrossfade()
+        resetTransition()
         playerNode.stop()
         audioFile = null
+        nodeOffsetSeconds = 0.0
         releaseStream()
 
         val track = _playbackState.value.queue.getOrNull(index) ?: return
@@ -414,13 +455,9 @@ actual class PlayerEngine {
         // Kotlin/Native despite the underlying ObjC initializer returning nil for a malformed
         // string, so any non-URL uri here previously crashed with an NPE right at construction -
         // same class of gotcha loadStream() below already avoids via URLWithString's nullable form.
-        val url = if (track.uri.contains("://")) {
-            NSURL.URLWithString(track.uri) ?: run {
-                _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
-                return
-            }
-        } else {
-            NSURL.fileURLWithPath(track.uri)
+        val url = localFileUrl(track) ?: run {
+            _playbackState.update { it.copy(status = PlaybackStatus.ERROR) }
+            return
         }
 
         runCatching {
@@ -441,7 +478,7 @@ actual class PlayerEngine {
                 atTime = null,
                 completionCallbackType = AVAudioPlayerNodeCompletionDataPlayedBack,
                 completionHandler = { _ ->
-                    if (currentGeneration == scheduleGeneration) handleTrackEnded()
+                    if (currentGeneration == scheduleGeneration) scope.launch { onSegmentEnded() }
                 },
             )
             playerNode.volume = volume
@@ -472,6 +509,166 @@ actual class PlayerEngine {
         } else {
             scope.launch { advance(direction = 1) }
         }
+    }
+
+    private fun localFileUrl(track: Track): NSURL? =
+        if (track.uri.contains("://")) NSURL.URLWithString(track.uri) else NSURL.fileURLWithPath(track.uri)
+
+    // A local segment on playerNode finished. If the next track was pre-scheduled right behind it
+    // (gapless), the node is already playing it: only the reported state moves on.
+    private fun onSegmentEnded() {
+        val next = gaplessNext ?: return handleTrackEnded()
+        val finished = audioFile
+        if (finished != null && finished.processingFormat.sampleRate > 0) {
+            nodeOffsetSeconds += (finished.length - segmentStartFrame) / finished.processingFormat.sampleRate
+        }
+        audioFile = next.file
+        segmentStartFrame = 0
+        resetTransition()
+        _positionMs.value = 0L
+        _playbackState.update {
+            it.copy(
+                currentIndex = next.index,
+                currentTrack = it.queue.getOrNull(next.index),
+                positionMs = 0L,
+                durationMs = next.file.durationMs(),
+            )
+        }
+        updateNowPlayingInfo()
+    }
+
+    // Runs from the 200 ms ticker. Shortly before a local track ends, decides its transition once:
+    // pre-schedule the next file on the same node (gapless), or plan a crossfade. Deciding this late
+    // keeps a repeat/shuffle change made earlier in the track effective.
+    private fun prepareTransitionIfDue() {
+        plannedFade?.let { fade ->
+            val playing = _playbackState.value.status == PlaybackStatus.PLAYING
+            if (playing && _positionMs.value >= fade.startAtMs) startCrossfade(fade)
+            return
+        }
+        if (transitionPrepared || fadeJob != null || streamPlayer != null || audioFile == null) return
+        val state = _playbackState.value
+        if (state.status != PlaybackStatus.PLAYING) return
+        val durationMs = state.durationMs?.takeIf { it > 0 } ?: return
+        val remainingMs = durationMs - _positionMs.value
+        if (remainingMs > crossfadeMs + Crossfade.PREPARE_LEAD_MS) return
+
+        transitionPrepared = true
+        val nextIndex = if (state.repeatMode == RepeatMode.ONE) state.currentIndex else nextIndex(state, direction = 1)
+        val nextTrack = nextIndex?.let { state.queue.getOrNull(it) } ?: return
+        if (nextTrack.isRemoteStream()) return
+        val windowMs = Crossfade.windowMs(
+            requestedMs = crossfadeMs,
+            outgoing = state.currentTrack,
+            outgoingIndex = state.currentIndex,
+            outgoingDurationMs = durationMs,
+            incoming = nextTrack,
+            incomingIndex = nextIndex,
+        )
+        if (windowMs > 0) {
+            plannedFade = PlannedFade(nextIndex, startAtMs = durationMs - windowMs)
+        } else {
+            scheduleGaplessNext(nextIndex, nextTrack)
+        }
+    }
+
+    private fun scheduleGaplessNext(index: Int, track: Track) {
+        val url = localFileUrl(track) ?: return
+        val file = runCatching { AVAudioFile(forReading = url, error = null) }.getOrNull() ?: return
+        val generation = scheduleGeneration
+        playerNode.scheduleSegment(
+            file = file,
+            startingFrame = 0,
+            frameCount = file.length.coerceAtLeast(0L).toUInt(),
+            atTime = null,
+            completionCallbackType = AVAudioPlayerNodeCompletionDataPlayedBack,
+            completionHandler = { _ ->
+                if (generation == scheduleGeneration) scope.launch { onSegmentEnded() }
+            },
+        )
+        gaplessNext = GaplessNext(index, file)
+    }
+
+    // Starts the next track on the idle node and ramps both node volumes. Bumping
+    // scheduleGeneration first means the outgoing node's completion - which fires again when it is
+    // stopped after the fade - can never auto-advance.
+    private fun startCrossfade(fade: PlannedFade) {
+        plannedFade = null
+        val state = _playbackState.value
+        val track = state.queue.getOrNull(fade.index) ?: return
+        val url = localFileUrl(track) ?: return
+        val file = runCatching { AVAudioFile(forReading = url, error = null) }.getOrNull() ?: return
+        val windowMs = ((state.durationMs ?: 0L) - _positionMs.value).coerceAtLeast(1L)
+
+        scheduleGeneration++
+        val generation = scheduleGeneration
+        val outgoing = playerNode
+        val incoming = idleNode
+        incoming.stop()
+        incoming.volume = 0f
+        incoming.scheduleSegment(
+            file = file,
+            startingFrame = 0,
+            frameCount = file.length.coerceAtLeast(0L).toUInt(),
+            atTime = null,
+            completionCallbackType = AVAudioPlayerNodeCompletionDataPlayedBack,
+            completionHandler = { _ ->
+                if (generation == scheduleGeneration) scope.launch { onSegmentEnded() }
+            },
+        )
+        if (!engine.running) engine.startAndReturnError(outError = null)
+        incoming.play()
+
+        playerNode = incoming
+        idleNode = outgoing
+        fadeOutNode = outgoing
+        audioFile = file
+        segmentStartFrame = 0
+        nodeOffsetSeconds = 0.0
+        resetTransition()
+        _positionMs.value = 0L
+        _playbackState.update {
+            it.copy(currentIndex = fade.index, currentTrack = track, positionMs = 0L, durationMs = file.durationMs())
+        }
+        updateNowPlayingInfo()
+
+        fadeJob = scope.launch {
+            var elapsedMs = 0L
+            while (isActive && elapsedMs < windowMs) {
+                val progress = elapsedMs.toFloat() / windowMs
+                incoming.volume = volume * Crossfade.fadeInGain(progress)
+                outgoing.volume = volume * Crossfade.fadeOutGain(progress)
+                delay(FADE_STEP_MS)
+                if (_playbackState.value.status == PlaybackStatus.PLAYING) elapsedMs += FADE_STEP_MS
+            }
+            fadeJob = null
+            finishCrossfade()
+        }
+    }
+
+    private fun finishCrossfade() {
+        fadeOutNode?.stop()
+        fadeOutNode = null
+        playerNode.volume = volume
+    }
+
+    private fun cancelCrossfade() {
+        plannedFade = null
+        val job = fadeJob ?: return
+        fadeJob = null
+        job.cancel()
+        finishCrossfade()
+    }
+
+    private fun resetTransition() {
+        transitionPrepared = false
+        gaplessNext = null
+        plannedFade = null
+    }
+
+    private fun AVAudioFile.durationMs(): Long {
+        val rate = processingFormat.sampleRate
+        return if (rate > 0) ((length.toDouble() / rate) * 1000).toLong() else 0L
     }
 
     private fun loadStream(track: Track, autoplay: Boolean, resumeAtMs: Long, generation: Int) {
@@ -558,9 +755,14 @@ actual class PlayerEngine {
         streamDurationKnown = false
     }
 
-    private fun Track.isRemoteStream(): Boolean =
-        uri.startsWith("http://", ignoreCase = true) || uri.startsWith("https://", ignoreCase = true)
+    private fun Track.isRemoteStream(): Boolean = Crossfade.isRemoteStream(uri)
 }
+
+private class GaplessNext(val index: Int, val file: AVAudioFile)
+
+private class PlannedFade(val index: Int, val startAtMs: Long)
+
+private const val FADE_STEP_MS = 50L
 
 // CMTime timescale for seeks: 1000 = millisecond resolution.
 private const val STREAM_TIMESCALE = 1000

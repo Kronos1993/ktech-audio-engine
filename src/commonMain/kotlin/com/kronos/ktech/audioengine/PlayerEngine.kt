@@ -80,6 +80,13 @@ expect class PlayerEngine {
      */
     fun setEqualizerBands(gainsDb: FloatArray)
 
+    /**
+     * Sets the crossfade length in milliseconds, `0` (the default) to turn it off. Applies only to
+     * natural end-of-track transitions between two different local tracks; manual skips, seeks,
+     * repeat-one and http(s) streams always cut. Track changes are gapless either way.
+     */
+    fun setCrossfadeDuration(durationMs: Long)
+
     /** Releases all underlying platform player resources. The engine must not be used afterward. */
     fun release()
 }

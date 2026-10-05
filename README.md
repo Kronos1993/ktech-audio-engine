@@ -145,6 +145,11 @@ playerEngine.selectOutputDevice(deviceId = "some-device-id")
 playerEngine.setEqualizerEnabled(true)
 playerEngine.setEqualizerBands(gainsDb = FloatArray(EqualizerBands.COUNT) { 0f })
 
+// Track changes are gapless on every platform. Optionally crossfade natural end-of-track
+// transitions (0 = off, the default). Manual skips, seeks, repeat-one and http(s) streams always
+// cut, and the fade never exceeds half of either track.
+playerEngine.setCrossfadeDuration(durationMs = 6_000)
+
 // Call this once, when your app is done with playback entirely (not on every screen exit) -
 // it tears down the underlying platform player and the engine can't be used again afterward.
 playerEngine.release()
