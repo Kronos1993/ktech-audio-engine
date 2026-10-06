@@ -150,6 +150,13 @@ playerEngine.setEqualizerBands(gainsDb = FloatArray(EqualizerBands.COUNT) { 0f }
 // cut, and the fade never exceeds half of either track.
 playerEngine.setCrossfadeDuration(durationMs = 6_000)
 
+// Playback speed, 0.5x..3x (1f = normal), pitch preserved. positionMs stays in track time.
+playerEngine.setPlaybackSpeed(1.5f)
+
+// Shortens silent passages (pauses longer than ~300 ms) on Android and Desktop. iOS has no PCM
+// path to cut on, so there supportsSkipSilence is false and this call is a no-op.
+if (playerEngine.supportsSkipSilence) playerEngine.setSkipSilenceEnabled(true)
+
 // Call this once, when your app is done with playback entirely (not on every screen exit) -
 // it tears down the underlying platform player and the engine can't be used again afterward.
 playerEngine.release()

@@ -14,6 +14,7 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
@@ -111,6 +112,7 @@ actual class PlayerEngine(
     private var queueTracks: List<Track> = emptyList()
     private var volume: Float = 1f
     private var crossfadeMs: Long = 0L
+    private var playbackSpeed: Float = 1f
 
     // Crossfade: the main exoPlayer (MediaSession, notification, ticker, visualizer) jumps to the
     // next item at the fade point and ramps up, while this headless helper plays the outgoing
@@ -456,6 +458,20 @@ actual class PlayerEngine(
         if (crossfadeMs == 0L) cancelCrossfade()
     }
 
+    // Sonic time-stretching inside ExoPlayer's audio sink; pitch stays at 1.
+    actual fun setPlaybackSpeed(speed: Float) {
+        playbackSpeed = speed.coerceIn(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED)
+        val parameters = PlaybackParameters(playbackSpeed)
+        exoPlayer.playbackParameters = parameters
+        fadeOutPlayer?.playbackParameters = parameters
+    }
+
+    actual val supportsSkipSilence: Boolean = true
+
+    actual fun setSkipSilenceEnabled(enabled: Boolean) {
+        exoPlayer.skipSilenceEnabled = enabled
+    }
+
     // Runs from the 200 ms ticker: shortly before the fade point, pre-loads the helper with the
     // current item paused at that point (so starting it costs no buffering) and arms a
     // PlayerMessage that fires exactly there.
@@ -498,7 +514,10 @@ actual class PlayerEngine(
         .Builder(appContext)
         .setRenderersFactory(LuminaRenderersFactory(appContext, fadeOutEqualizer))
         .build()
-        .also { it.setPreferredAudioDevice(preferredAudioDevice) }
+        .also {
+            it.setPreferredAudioDevice(preferredAudioDevice)
+            it.playbackParameters = PlaybackParameters(playbackSpeed)
+        }
 
     private fun startCrossfade(index: Int, windowMs: Long) {
         val helper = fadeOutPlayer
@@ -522,7 +541,8 @@ actual class PlayerEngine(
                 exoPlayer.volume = volume * Crossfade.fadeInGain(progress)
                 helper.volume = volume * Crossfade.fadeOutGain(progress)
                 delay(FADE_STEP_MS)
-                if (exoPlayer.isPlaying) elapsedMs += FADE_STEP_MS
+                // windowMs is track time, which runs playbackSpeed times faster than wall time.
+                if (exoPlayer.isPlaying) elapsedMs += (FADE_STEP_MS * playbackSpeed).toLong()
             }
             finishCrossfade()
         }

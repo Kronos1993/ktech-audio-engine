@@ -7,6 +7,10 @@ import com.kronos.ktech.audioengine.domain.RepeatMode
 import com.kronos.ktech.audioengine.domain.Track
 import kotlinx.coroutines.flow.StateFlow
 
+// Accepted range for setPlaybackSpeed(); values outside are clamped.
+internal const val MIN_PLAYBACK_SPEED = 0.5f
+internal const val MAX_PLAYBACK_SPEED = 3f
+
 /**
  * A multiplatform audio playback engine (Android/iOS/Desktop) driving one shared [playbackState].
  *
@@ -86,6 +90,21 @@ expect class PlayerEngine {
      * repeat-one and http(s) streams always cut. Track changes are gapless either way.
      */
     fun setCrossfadeDuration(durationMs: Long)
+
+    /**
+     * Sets the playback speed, `1f` (the default) for normal speed. Pitch is preserved. Applies to
+     * every track until changed again; [positionMs] stays in track time.
+     */
+    fun setPlaybackSpeed(speed: Float)
+
+    /** Whether [setSkipSilenceEnabled] has any effect on this platform. */
+    val supportsSkipSilence: Boolean
+
+    /**
+     * Enables or disables shortening silent passages. A no-op where [supportsSkipSilence] is
+     * `false` (iOS).
+     */
+    fun setSkipSilenceEnabled(enabled: Boolean)
 
     /** Releases all underlying platform player resources. The engine must not be used afterward. */
     fun release()

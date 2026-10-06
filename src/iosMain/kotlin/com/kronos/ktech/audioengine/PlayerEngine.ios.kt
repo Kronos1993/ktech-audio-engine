@@ -39,7 +39,9 @@ import platform.AVFAudio.AVAudioSessionInterruptionTypeKey
 import platform.AVFAudio.AVAudioUnitEQ
 import platform.AVFAudio.AVAudioUnitEQFilterParameters
 import platform.AVFAudio.AVAudioUnitEQFilterTypeParametric
+import platform.AVFAudio.AVAudioUnitTimePitch
 import platform.AVFAudio.setActive
+import platform.AVFoundation.AVAudioTimePitchAlgorithmSpectral
 import platform.AVFoundation.AVPlayer
 import platform.AVFoundation.AVPlayerItem
 import platform.AVFoundation.AVPlayerItemDidPlayToEndTimeNotification
@@ -52,6 +54,8 @@ import platform.AVFoundation.pause
 import platform.AVFoundation.play
 import platform.AVFoundation.replaceCurrentItemWithPlayerItem
 import platform.AVFoundation.seekToTime
+import platform.AVFoundation.setAudioTimePitchAlgorithm
+import platform.AVFoundation.setRate
 import platform.AVFoundation.setVolume
 import platform.AVFoundation.timeControlStatus
 import platform.CoreMedia.CMTimeGetSeconds
@@ -104,6 +108,11 @@ actual class PlayerEngine {
     private var idleNode = AVAudioPlayerNode()
     private val submixer = AVAudioMixerNode()
     private val eqNode = AVAudioUnitEQ(numberOfBands = EqualizerBands.COUNT.toULong())
+
+    // Time-stretches the mixed local signal; pitch stays unchanged. Upstream player nodes render
+    // rate x faster, so their sample time (the position) stays in track time.
+    private val timePitch = AVAudioUnitTimePitch()
+    private var playbackSpeed = 1f
 
     private var audioFile: AVAudioFile? = null
     private var volume: Float = 1f
@@ -169,10 +178,12 @@ actual class PlayerEngine {
         engine.attachNode(playerNode)
         engine.attachNode(idleNode)
         engine.attachNode(submixer)
+        engine.attachNode(timePitch)
         engine.attachNode(eqNode)
         engine.connect(playerNode, to = submixer, fromBus = 0u, toBus = 0u, format = null)
         engine.connect(idleNode, to = submixer, fromBus = 0u, toBus = 1u, format = null)
-        engine.connect(submixer, to = eqNode, format = null)
+        engine.connect(submixer, to = timePitch, format = null)
+        engine.connect(timePitch, to = eqNode, format = null)
         engine.connect(eqNode, to = engine.mainMixerNode, format = null)
         configureEqualizerBands()
         eqNode.bypass = true
@@ -308,7 +319,7 @@ actual class PlayerEngine {
             track.album?.let { put(MPMediaItemPropertyAlbumTitle, it) }
             put(MPMediaItemPropertyPlaybackDuration, (state.durationMs ?: 0L) / 1000.0)
             put(MPNowPlayingInfoPropertyElapsedPlaybackTime, _positionMs.value / 1000.0)
-            put(MPNowPlayingInfoPropertyPlaybackRate, if (state.status == PlaybackStatus.PLAYING) 1.0 else 0.0)
+            put(MPNowPlayingInfoPropertyPlaybackRate, if (state.status == PlaybackStatus.PLAYING) playbackSpeed.toDouble() else 0.0)
         }
         MPNowPlayingInfoCenter.defaultCenter().nowPlayingInfo = info
     }
@@ -332,6 +343,8 @@ actual class PlayerEngine {
         streamPlayer?.let { player ->
             streamWantsPlayback = true
             player.play()
+            // AVPlayer.play() resets the rate to 1.
+            if (playbackSpeed != 1f) player.setRate(playbackSpeed)
             _playbackState.update { it.copy(status = PlaybackStatus.BUFFERING) }
             updateNowPlayingInfo()
             return
@@ -435,6 +448,20 @@ actual class PlayerEngine {
         crossfadeMs = durationMs.coerceAtLeast(0L)
         if (crossfadeMs == 0L) plannedFade = null
     }
+
+    actual fun setPlaybackSpeed(speed: Float) {
+        playbackSpeed = speed.coerceIn(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED)
+        timePitch.rate = playbackSpeed
+        streamPlayer?.let { player ->
+            if (streamWantsPlayback) player.setRate(playbackSpeed)
+        }
+        updateNowPlayingInfo()
+    }
+
+    // AVAudioPlayerNode and AVPlayer give no PCM path where silence could be dropped.
+    actual val supportsSkipSilence: Boolean = false
+
+    actual fun setSkipSilenceEnabled(enabled: Boolean) = Unit
 
     actual fun release() {
         commandCenter.playCommand.removeTarget(null)
@@ -697,7 +724,8 @@ actual class PlayerEngine {
                 incoming.volume = volume * Crossfade.fadeInGain(progress)
                 outgoing.volume = volume * Crossfade.fadeOutGain(progress)
                 delay(FADE_STEP_MS)
-                if (_playbackState.value.status == PlaybackStatus.PLAYING) elapsedMs += FADE_STEP_MS
+                // windowMs is track time, which runs playbackSpeed times faster than wall time.
+                if (_playbackState.value.status == PlaybackStatus.PLAYING) elapsedMs += (FADE_STEP_MS * playbackSpeed).toLong()
             }
             fadeJob = null
             finishCrossfade()
@@ -738,6 +766,7 @@ actual class PlayerEngine {
             return
         }
         val item = AVPlayerItem(uRL = url)
+        item.setAudioTimePitchAlgorithm(AVAudioTimePitchAlgorithmSpectral)
         val player = AVPlayer(playerItem = item)
         player.setVolume(volume)
         streamItem = item
@@ -764,7 +793,10 @@ actual class PlayerEngine {
                 status = if (autoplay) PlaybackStatus.BUFFERING else PlaybackStatus.PAUSED,
             )
         }
-        if (autoplay) player.play()
+        if (autoplay) {
+            player.play()
+            if (playbackSpeed != 1f) player.setRate(playbackSpeed)
+        }
         updateNowPlayingInfo()
     }
 

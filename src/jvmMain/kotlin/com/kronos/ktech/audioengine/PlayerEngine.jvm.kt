@@ -82,6 +82,10 @@ actual class PlayerEngine {
 
     @Volatile private var crossfadeMs: Long = 0L
 
+    @Volatile private var playbackSpeed: Float = 1f
+
+    @Volatile private var skipSilenceEnabled = false
+
     // One EqualizerChain per audio channel of the CURRENT track (rebuilt in startTrack() once
     // grabber.audioChannels is known) - interleaved multi-channel PCM would otherwise corrupt
     // a single shared filter's internal state by alternating unrelated channels' samples
@@ -241,6 +245,17 @@ actual class PlayerEngine {
         crossfadeMs = durationMs.coerceAtLeast(0L)
     }
 
+    // Read by the playback loop on every chunk.
+    actual fun setPlaybackSpeed(speed: Float) {
+        playbackSpeed = speed.coerceIn(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED)
+    }
+
+    actual val supportsSkipSilence: Boolean = true
+
+    actual fun setSkipSilenceEnabled(enabled: Boolean) {
+        skipSilenceEnabled = enabled
+    }
+
     actual fun release() {
         playbackJob?.cancel()
         playbackJob = null
@@ -316,6 +331,7 @@ actual class PlayerEngine {
             var fadeDoneFrames = 0L
             // The source whose fade-or-cut decision was already made (decided once per track).
             var fadeDecidedFor: PcmSource? = null
+            var tempo: TempoFilter? = null
             try {
                 val grabber = FFmpegFrameGrabber(resolveMediaPath(track.uri))
                 // Must be set BEFORE start() - FFmpegFrameGrabber only wires ffmpeg's
@@ -363,6 +379,11 @@ actual class PlayerEngine {
                 currentLine = line
                 applyVolume(line)
 
+                // Both work on track-time PCM after the sources, so positionMs (consumed source
+                // frames) stays in track time: skipped silence and time-stretching never skew it.
+                val silenceSkipper = SilenceSkipper(sampleRate, channels)
+                tempo = TempoFilter(sampleRate, channels)
+
                 var lastNowPlayingSyncAt = System.currentTimeMillis()
 
                 while (isActive) {
@@ -376,6 +397,8 @@ actual class PlayerEngine {
                             incoming = null
                         }
                         source!!.seek(seekMs)
+                        silenceSkipper.reset()
+                        tempo.reset()
                         fadeDecidedFor = null
                         _positionMs.value = seekMs
                         _playbackState.update { it.copy(positionMs = seekMs) }
@@ -435,6 +458,10 @@ actual class PlayerEngine {
                     if (fading != null) {
                         samples = mix(samples, fading.take(samples.size), channels, fadeDoneFrames, fadeTotalFrames)
                         fadeDoneFrames += samples.size / channels
+                        // Never cut inside a crossfade overlap; release anything held back first.
+                        samples = silenceSkipper.flush() + samples
+                    } else {
+                        samples = silenceSkipper.process(samples, skipSilenceEnabled)
                     }
 
                     if (equalizerChannels.isNotEmpty()) {
@@ -444,16 +471,21 @@ actual class PlayerEngine {
                         }
                     }
 
-                    var peak = 0
-                    for (s in samples) {
-                        val a = abs(s.toInt())
-                        if (a > peak) peak = a
-                    }
-                    _audioLevel.value = (peak / Short.MAX_VALUE.toFloat()).coerceIn(0f, 1f)
+                    samples = tempo.process(samples, playbackSpeed)
 
-                    val byteBuffer = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-                    byteBuffer.asShortBuffer().put(samples)
-                    line.write(byteBuffer.array(), 0, byteBuffer.array().size)
+                    // Empty while the skipper holds back silence or atempo is still buffering.
+                    if (samples.isNotEmpty()) {
+                        var peak = 0
+                        for (s in samples) {
+                            val a = abs(s.toInt())
+                            if (a > peak) peak = a
+                        }
+                        _audioLevel.value = (peak / Short.MAX_VALUE.toFloat()).coerceIn(0f, 1f)
+
+                        val byteBuffer = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+                        byteBuffer.asShortBuffer().put(samples)
+                        line.write(byteBuffer.array(), 0, byteBuffer.array().size)
+                    }
 
                     if (fading != null && fadeDoneFrames >= fadeTotalFrames) {
                         // The outgoing track is silent from here on: drop it.
@@ -477,6 +509,7 @@ actual class PlayerEngine {
             } finally {
                 source?.close()
                 incoming?.close()
+                tempo?.reset()
             }
         }
     }
