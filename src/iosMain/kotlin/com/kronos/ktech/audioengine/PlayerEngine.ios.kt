@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import platform.AVFAudio.AVAudioEngine
+import platform.AVFAudio.AVAudioEngineConfigurationChangeNotification
 import platform.AVFAudio.AVAudioFile
 import platform.AVFAudio.AVAudioFramePosition
 import platform.AVFAudio.AVAudioMixerNode
@@ -29,6 +30,12 @@ import platform.AVFAudio.AVAudioPlayerNode
 import platform.AVFAudio.AVAudioPlayerNodeCompletionDataPlayedBack
 import platform.AVFAudio.AVAudioSession
 import platform.AVFAudio.AVAudioSessionCategoryPlayback
+import platform.AVFAudio.AVAudioSessionInterruptionNotification
+import platform.AVFAudio.AVAudioSessionInterruptionOptionKey
+import platform.AVFAudio.AVAudioSessionInterruptionOptionShouldResume
+import platform.AVFAudio.AVAudioSessionInterruptionTypeBegan
+import platform.AVFAudio.AVAudioSessionInterruptionTypeEnded
+import platform.AVFAudio.AVAudioSessionInterruptionTypeKey
 import platform.AVFAudio.AVAudioUnitEQ
 import platform.AVFAudio.AVAudioUnitEQFilterParameters
 import platform.AVFAudio.AVAudioUnitEQFilterTypeParametric
@@ -50,6 +57,7 @@ import platform.AVFoundation.timeControlStatus
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
 import platform.Foundation.NSNotificationCenter
+import platform.Foundation.NSNumber
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSURL
 import platform.MediaPlayer.MPMediaItemPropertyAlbumTitle
@@ -141,6 +149,12 @@ actual class PlayerEngine {
     private var streamItem: AVPlayerItem? = null
     private var streamEndObserver: Any? = null
 
+    // The system stops AVAudioEngine on an interruption or configuration change without telling the
+    // node, so the state is moved to PAUSED here; play() restarts the engine.
+    private var interruptionObserver: Any? = null
+    private var engineConfigurationObserver: Any? = null
+    private var pausedByInterruption = false
+
     // What the user asked for; the displayed status is derived from it plus AVPlayer's
     // timeControlStatus so a stalled/buffering stream reads BUFFERING rather than PLAYING.
     private var streamWantsPlayback = false
@@ -165,6 +179,7 @@ actual class PlayerEngine {
         installLevelTap()
         engine.prepare()
         engine.startAndReturnError(outError = null)
+        observeEngineStops()
 
         commandCenter.playCommand.addTargetWithHandler { _ ->
             play()
@@ -222,6 +237,43 @@ actual class PlayerEngine {
         }
     }
 
+    private fun observeEngineStops() {
+        val center = NSNotificationCenter.defaultCenter
+        interruptionObserver = center.addObserverForName(
+            name = AVAudioSessionInterruptionNotification,
+            `object` = AVAudioSession.sharedInstance(),
+            queue = NSOperationQueue.mainQueue,
+        ) { notification ->
+            val info = notification?.userInfo ?: return@addObserverForName
+            val type = (info[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.unsignedLongValue
+            when (type) {
+                AVAudioSessionInterruptionTypeBegan -> {
+                    val status = _playbackState.value.status
+                    if (status == PlaybackStatus.PLAYING || status == PlaybackStatus.BUFFERING) {
+                        pausedByInterruption = true
+                        pause()
+                    }
+                }
+                AVAudioSessionInterruptionTypeEnded -> {
+                    val options = (info[AVAudioSessionInterruptionOptionKey] as? NSNumber)?.unsignedLongValue ?: 0uL
+                    val shouldResume = options and AVAudioSessionInterruptionOptionShouldResume != 0uL
+                    if (pausedByInterruption && shouldResume) {
+                        AVAudioSession.sharedInstance().setActive(true, error = null)
+                        play()
+                    }
+                    pausedByInterruption = false
+                }
+            }
+        }
+        engineConfigurationObserver = center.addObserverForName(
+            name = AVAudioEngineConfigurationChangeNotification,
+            `object` = engine,
+            queue = NSOperationQueue.mainQueue,
+        ) { _ ->
+            if (streamPlayer == null && _playbackState.value.status == PlaybackStatus.PLAYING) pause()
+        }
+    }
+
     private fun updatePositionFromNode() {
         val player = streamPlayer
         if (player != null) {
@@ -229,7 +281,11 @@ actual class PlayerEngine {
             return
         }
         val file = audioFile ?: return
+        // A stopped or reconfigured engine (interruption, session category or route change) leaves an
+        // invalid render time, and playerTimeForNodeTime raises an uncaught NSException for it.
+        if (!engine.running) return
         val nodeTime = playerNode.lastRenderTime ?: return
+        if (!nodeTime.sampleTimeValid && !nodeTime.hostTimeValid) return
         val playerTime = playerNode.playerTimeForNodeTime(nodeTime) ?: return
         val fileRate = file.processingFormat.sampleRate
         val nodeRate = playerTime.sampleRate
@@ -385,6 +441,8 @@ actual class PlayerEngine {
         commandCenter.pauseCommand.removeTarget(null)
         commandCenter.nextTrackCommand.removeTarget(null)
         commandCenter.previousTrackCommand.removeTarget(null)
+        interruptionObserver?.let { NSNotificationCenter.defaultCenter.removeObserver(it) }
+        engineConfigurationObserver?.let { NSNotificationCenter.defaultCenter.removeObserver(it) }
         tickerJob?.cancel()
         scope.cancel()
         scheduleGeneration++
