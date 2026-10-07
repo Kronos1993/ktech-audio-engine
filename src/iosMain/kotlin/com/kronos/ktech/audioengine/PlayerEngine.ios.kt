@@ -42,14 +42,19 @@ import platform.AVFAudio.AVAudioUnitEQFilterTypeParametric
 import platform.AVFAudio.AVAudioUnitTimePitch
 import platform.AVFAudio.setActive
 import platform.AVFoundation.AVAudioTimePitchAlgorithmSpectral
+import platform.AVFoundation.AVMetadataExtraAttributeInfoKey
+import platform.AVFoundation.AVMetadataItem
 import platform.AVFoundation.AVPlayer
 import platform.AVFoundation.AVPlayerItem
 import platform.AVFoundation.AVPlayerItemDidPlayToEndTimeNotification
 import platform.AVFoundation.AVPlayerItemStatusFailed
 import platform.AVFoundation.AVPlayerItemStatusReadyToPlay
 import platform.AVFoundation.AVPlayerTimeControlStatusPlaying
+import platform.AVFoundation.AVURLAsset
 import platform.AVFoundation.currentTime
 import platform.AVFoundation.duration
+import platform.AVFoundation.key
+import platform.AVFoundation.metadata
 import platform.AVFoundation.pause
 import platform.AVFoundation.play
 import platform.AVFoundation.replaceCurrentItemWithPlayerItem
@@ -57,6 +62,7 @@ import platform.AVFoundation.seekToTime
 import platform.AVFoundation.setAudioTimePitchAlgorithm
 import platform.AVFoundation.setRate
 import platform.AVFoundation.setVolume
+import platform.AVFoundation.stringValue
 import platform.AVFoundation.timeControlStatus
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
@@ -74,6 +80,7 @@ import platform.MediaPlayer.MPNowPlayingInfoPropertyPlaybackRate
 import platform.MediaPlayer.MPRemoteCommandCenter
 import platform.MediaPlayer.MPRemoteCommandHandlerStatusSuccess
 import kotlin.math.abs
+import kotlin.math.log10
 
 // Real EQ requires AVAudioEngine's node graph - AVAudioPlayer (used previously here) has no
 // effects graph at all and cannot host AVAudioUnitEQ (real-audio-equalizer proposal.md §2).
@@ -108,6 +115,16 @@ actual class PlayerEngine {
     private var idleNode = AVAudioPlayerNode()
     private val submixer = AVAudioMixerNode()
     private val eqNode = AVAudioUnitEQ(numberOfBands = EqualizerBands.COUNT.toULong())
+
+    // ReplayGain: one gain unit after each player node (node volume can't exceed 1.0 and
+    // already carries the user volume and crossfade ramp). Each unit swaps roles with its node.
+    private var playerGain = replayGainUnit()
+    private var idleGain = replayGainUnit()
+    private var replayGainConfig = ReplayGainConfig()
+    private var playerTags = ReplayGainTags.NONE
+    private var idleTags = ReplayGainTags.NONE
+    private var gaplessNextTags = ReplayGainTags.NONE
+    private var gainRampJob: Job? = null
 
     // Time-stretches the mixed local signal; pitch stays unchanged. Upstream player nodes render
     // rate x faster, so their sample time (the position) stays in track time.
@@ -180,8 +197,12 @@ actual class PlayerEngine {
         engine.attachNode(submixer)
         engine.attachNode(timePitch)
         engine.attachNode(eqNode)
-        engine.connect(playerNode, to = submixer, fromBus = 0u, toBus = 0u, format = null)
-        engine.connect(idleNode, to = submixer, fromBus = 0u, toBus = 1u, format = null)
+        engine.attachNode(playerGain)
+        engine.attachNode(idleGain)
+        engine.connect(playerNode, to = playerGain, format = null)
+        engine.connect(idleNode, to = idleGain, format = null)
+        engine.connect(playerGain, to = submixer, fromBus = 0u, toBus = 0u, format = null)
+        engine.connect(idleGain, to = submixer, fromBus = 0u, toBus = 1u, format = null)
         engine.connect(submixer, to = timePitch, format = null)
         engine.connect(timePitch, to = eqNode, format = null)
         engine.connect(eqNode, to = engine.mainMixerNode, format = null)
@@ -424,7 +445,7 @@ actual class PlayerEngine {
         this.volume = volume.coerceIn(0f, 1f)
         // During a fade the ramp applies the new volume on its next step.
         if (fadeJob == null) playerNode.volume = this.volume
-        streamPlayer?.setVolume(this.volume)
+        streamPlayer?.setVolume(this.volume * streamReplayGain())
         _playbackState.update { it.copy(volume = this.volume) }
     }
 
@@ -462,6 +483,62 @@ actual class PlayerEngine {
     actual val supportsSkipSilence: Boolean = false
 
     actual fun setSkipSilenceEnabled(enabled: Boolean) = Unit
+
+    actual fun setReplayGain(mode: ReplayGainMode, preampDb: Float, fallbackDb: Float) {
+        replayGainConfig = ReplayGainConfig(mode, preampDb, fallbackDb)
+        rampGain(playerGain, replayGainDb(playerTags))
+        idleGain.globalGain = replayGainDb(idleTags)
+        streamPlayer?.setVolume(volume * streamReplayGain())
+    }
+
+    private fun replayGainUnit(): AVAudioUnitEQ = AVAudioUnitEQ(numberOfBands = 1u).apply {
+        (bands[0] as AVAudioUnitEQFilterParameters).bypass = true
+        globalGain = 0f
+    }
+
+    // AVAudioUnitEQ.globalGain range: -96..+24 dB.
+    private fun replayGainDb(tags: ReplayGainTags): Float {
+        val gain = ReplayGain.linearGain(replayGainConfig, tags)
+        return if (gain <= 0f) -96f else (20f * log10(gain)).coerceIn(-96f, 24f)
+    }
+
+    // AVPlayer volume can't exceed 1.0 and stream tags aren't read: untagged fallback, attenuation only.
+    private fun streamReplayGain(): Float = ReplayGain.linearGain(replayGainConfig, ReplayGainTags.NONE).coerceAtMost(1f)
+
+    // Applies a new gain to the current node without a click: a short stepped ramp.
+    private fun rampGain(unit: AVAudioUnitEQ, targetDb: Float) {
+        gainRampJob?.cancel()
+        val startDb = unit.globalGain
+        if (startDb == targetDb) return
+        gainRampJob = scope.launch {
+            for (step in 1..GAIN_RAMP_STEPS) {
+                unit.globalGain = startDb + (targetDb - startDb) * step / GAIN_RAMP_STEPS
+                delay(GAIN_RAMP_STEP_MS)
+            }
+            gainRampJob = null
+        }
+    }
+
+    // Sets a node's gain at once, for a node that is about to start a new track.
+    private fun setGainNow(unit: AVAudioUnitEQ, tags: ReplayGainTags) {
+        if (unit === playerGain) gainRampJob?.cancel()
+        unit.globalGain = replayGainDb(tags)
+    }
+
+    // Reads ReplayGain tags from the file's metadata in every key space (ID3 TXXX, iTunes
+    // freeform, Vorbis comments), matching on any of the item's names.
+    private fun readReplayGainTags(url: NSURL): ReplayGainTags = runCatching {
+        val entries = AVURLAsset(uRL = url, options = null).metadata.flatMap { raw ->
+            val item = raw as? AVMetadataItem ?: return@flatMap emptyList()
+            val value = item.stringValue ?: return@flatMap emptyList()
+            listOfNotNull(
+                item.identifier,
+                item.key as? String,
+                item.extraAttributes?.get(AVMetadataExtraAttributeInfoKey) as? String,
+            ).map { it to value }
+        }
+        ReplayGain.parseTags(entries)
+    }.getOrDefault(ReplayGainTags.NONE)
 
     actual fun release() {
         commandCenter.playCommand.removeTarget(null)
@@ -548,6 +625,8 @@ actual class PlayerEngine {
         runCatching {
             val file = AVAudioFile(forReading = url, error = null)
             audioFile = file
+            playerTags = readReplayGainTags(url)
+            setGainNow(playerGain, playerTags)
             val sampleRate = file.processingFormat.sampleRate
             val startFrame: AVAudioFramePosition = if (resumeAtMs > 0 && sampleRate > 0) {
                 (resumeAtMs / 1000.0 * sampleRate).toLong()
@@ -608,6 +687,10 @@ actual class PlayerEngine {
             nodeOffsetSeconds += (finished.length - segmentStartFrame) / finished.processingFormat.sampleRate
         }
         audioFile = next.file
+        // Fires once the previous segment has played back, so the first few ms of the new
+        // track may still sound at the previous gain.
+        playerTags = gaplessNextTags
+        setGainNow(playerGain, playerTags)
         segmentStartFrame = 0
         resetTransition()
         _positionMs.value = 0L
@@ -672,6 +755,7 @@ actual class PlayerEngine {
             },
         )
         gaplessNext = GaplessNext(index, file)
+        gaplessNextTags = readReplayGainTags(url)
     }
 
     // Starts the next track on the idle node and ramps both node volumes. Bumping
@@ -691,6 +775,8 @@ actual class PlayerEngine {
         val incoming = idleNode
         incoming.stop()
         incoming.volume = 0f
+        val incomingTags = readReplayGainTags(url)
+        setGainNow(idleGain, incomingTags)
         incoming.scheduleSegment(
             file = file,
             startingFrame = 0,
@@ -707,6 +793,12 @@ actual class PlayerEngine {
         playerNode = incoming
         idleNode = outgoing
         fadeOutNode = outgoing
+        gainRampJob?.cancel()
+        val outgoingGain = playerGain
+        playerGain = idleGain
+        idleGain = outgoingGain
+        idleTags = playerTags
+        playerTags = incomingTags
         audioFile = file
         segmentStartFrame = 0
         nodeOffsetSeconds = 0.0
@@ -768,7 +860,7 @@ actual class PlayerEngine {
         val item = AVPlayerItem(uRL = url)
         item.setAudioTimePitchAlgorithm(AVAudioTimePitchAlgorithmSpectral)
         val player = AVPlayer(playerItem = item)
-        player.setVolume(volume)
+        player.setVolume(volume * streamReplayGain())
         streamItem = item
         streamPlayer = player
         streamDurationKnown = false
@@ -853,6 +945,9 @@ private class GaplessNext(val index: Int, val file: AVAudioFile)
 private class PlannedFade(val index: Int, val startAtMs: Long)
 
 private const val FADE_STEP_MS = 50L
+
+private const val GAIN_RAMP_STEPS = 5
+private const val GAIN_RAMP_STEP_MS = 10L
 
 // CMTime timescale for seeks: 1000 = millisecond resolution.
 private const val STREAM_TIMESCALE = 1000

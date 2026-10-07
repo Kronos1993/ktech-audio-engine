@@ -157,6 +157,11 @@ playerEngine.setPlaybackSpeed(1.5f)
 // path to cut on, so there supportsSkipSilence is false and this call is a no-op.
 if (playerEngine.supportsSkipSilence) playerEngine.setSkipSilenceEnabled(true)
 
+// ReplayGain normalization (OFF by default). Tags are read from each file as it loads (ID3 TXXX,
+// Vorbis comments, MP4 freeform atoms). preampDb is added to tagged tracks; untagged tracks play
+// at fallbackDb. A peak tag caps the gain so the track never clips. Independent of setVolume.
+playerEngine.setReplayGain(ReplayGainMode.ALBUM, preampDb = 0f, fallbackDb = -6f)
+
 // Call this once, when your app is done with playback entirely (not on every screen exit) -
 // it tears down the underlying platform player and the engine can't be used again afterward.
 playerEngine.release()

@@ -106,6 +106,14 @@ expect class PlayerEngine {
      */
     fun setSkipSilenceEnabled(enabled: Boolean)
 
+    /**
+     * Sets ReplayGain normalization, [ReplayGainMode.OFF] by default. Tags are read from each
+     * file as it loads. [preampDb] is added to tagged tracks; untagged tracks play at
+     * [fallbackDb] instead. A peak tag caps the gain so the track never clips. Takes effect
+     * immediately, with a short ramp; independent of [setVolume].
+     */
+    fun setReplayGain(mode: ReplayGainMode, preampDb: Float, fallbackDb: Float)
+
     /** Releases all underlying platform player resources. The engine must not be used afterward. */
     fun release()
 }

@@ -86,6 +86,8 @@ actual class PlayerEngine {
 
     @Volatile private var skipSilenceEnabled = false
 
+    @Volatile private var replayGainConfig = ReplayGainConfig()
+
     // One EqualizerChain per audio channel of the CURRENT track (rebuilt in startTrack() once
     // grabber.audioChannels is known) - interleaved multi-channel PCM would otherwise corrupt
     // a single shared filter's internal state by alternating unrelated channels' samples
@@ -256,6 +258,11 @@ actual class PlayerEngine {
         skipSilenceEnabled = enabled
     }
 
+    // Read by every open PcmSource on its next decoded chunk.
+    actual fun setReplayGain(mode: ReplayGainMode, preampDb: Float, fallbackDb: Float) {
+        replayGainConfig = ReplayGainConfig(mode, preampDb, fallbackDb)
+    }
+
     actual fun release() {
         playbackJob?.cancel()
         playbackJob = null
@@ -343,7 +350,7 @@ actual class PlayerEngine {
                 // instead of opening at the source file's own native rate and having
                 // javax.sound.sampled reject it as an unsupported format for that mixer.
                 preferredSampleRateFor(currentMixerInfo)?.let { grabber.sampleRate = it }
-                source = PcmSource(index, grabber)
+                source = PcmSource(index, grabber) { replayGainConfig }
                 grabber.start()
                 val sampleRate = grabber.sampleRate
                 val channels = grabber.audioChannels
@@ -522,7 +529,7 @@ actual class PlayerEngine {
         val grabber = FFmpegFrameGrabber(resolveMediaPath(track.uri))
         grabber.sampleRate = sampleRate
         grabber.audioChannels = channels
-        val source = PcmSource(index, grabber)
+        val source = PcmSource(index, grabber) { replayGainConfig }
         try {
             grabber.start()
         } catch (t: Throwable) {
@@ -699,10 +706,12 @@ actual class PlayerEngine {
 }
 
 // One decoded queue item, read as interleaved 16-bit PCM. Position is derived from the samples
-// handed out, so it stays exact when chunks are split across a crossfade mix.
+// handed out, so it stays exact when chunks are split across a crossfade mix. Each source applies
+// its own ReplayGain before any mixing, so a crossfade blends two normalized tracks.
 private class PcmSource(
     val index: Int,
     private val grabber: FFmpegFrameGrabber,
+    private val replayGainConfig: () -> ReplayGainConfig,
 ) {
     private var sampleRate = 1
     private var channels = 1
@@ -715,9 +724,17 @@ private class PcmSource(
 
     val positionMs: Long get() = startMs + consumedFrames * 1000 / sampleRate
 
+    private val gainStage = GainStage()
+    private var tags = ReplayGainTags.NONE
+    private var appliedConfig: ReplayGainConfig? = null
+
+    // Call after grabber.start(). Ogg keeps its Vorbis comments on the audio stream, not the
+    // container, so both maps are read.
     fun configure(sampleRate: Int, channels: Int) {
         this.sampleRate = sampleRate.coerceAtLeast(1)
         this.channels = channels.coerceAtLeast(1)
+        val metadata = grabber.metadata.orEmpty().toList() + grabber.audioMetadata.orEmpty().toList()
+        tags = ReplayGain.parseTags(metadata)
     }
 
     fun seek(positionMs: Long) {
@@ -761,8 +778,21 @@ private class PcmSource(
         while (true) {
             val frame = grabber.grabSamples() ?: return null
             val samples = frame.samples?.getOrNull(0) as? ShortBuffer ?: continue
-            return ShortArray(samples.remaining()).also { samples.get(it) }
+            return ShortArray(samples.remaining()).also {
+                samples.get(it)
+                applyReplayGain(it)
+            }
         }
+    }
+
+    // The first chunk jumps straight to this track's gain; later config changes ramp.
+    private fun applyReplayGain(samples: ShortArray) {
+        val config = replayGainConfig()
+        if (config != appliedConfig) {
+            gainStage.set(ReplayGain.linearGain(config, tags), smooth = appliedConfig != null)
+            appliedConfig = config
+        }
+        gainStage.process(samples, channels, sampleRate)
     }
 
     fun close() {

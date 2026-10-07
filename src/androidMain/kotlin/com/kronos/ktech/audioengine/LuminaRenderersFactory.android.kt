@@ -15,16 +15,20 @@ import com.kronos.ktech.audioengine.eq.LuminaEqualizerAudioProcessor
 class LuminaRenderersFactory(
     context: Context,
     private val equalizerAudioProcessor: LuminaEqualizerAudioProcessor,
+    private val replayGainAudioProcessor: ReplayGainAudioProcessor,
 ) : DefaultRenderersFactory(context) {
     override fun buildAudioSink(
         context: Context,
         enableFloatOutput: Boolean,
         enableAudioTrackPlaybackParams: Boolean,
     ): AudioSink =
-        DefaultAudioSink
-            .Builder(context)
-            .setAudioProcessors(arrayOf<AudioProcessor>(equalizerAudioProcessor))
-            .setEnableFloatOutput(enableFloatOutput)
-            .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-            .build()
+        ReplayGainAudioSink(
+            DefaultAudioSink
+                .Builder(context)
+                .setAudioProcessors(arrayOf<AudioProcessor>(replayGainAudioProcessor, equalizerAudioProcessor))
+                .setEnableFloatOutput(enableFloatOutput)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .build(),
+            replayGainAudioProcessor,
+        )
 }

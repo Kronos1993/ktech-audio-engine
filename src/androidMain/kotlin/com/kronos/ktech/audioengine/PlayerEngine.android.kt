@@ -69,9 +69,10 @@ actual class PlayerEngine(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val equalizerAudioProcessor = LuminaEqualizerAudioProcessor()
+    private val replayGainAudioProcessor = ReplayGainAudioProcessor()
     internal val exoPlayer: ExoPlayer = ExoPlayer
         .Builder(appContext)
-        .setRenderersFactory(LuminaRenderersFactory(appContext, equalizerAudioProcessor))
+        .setRenderersFactory(LuminaRenderersFactory(appContext, equalizerAudioProcessor, replayGainAudioProcessor))
         .build()
 
     private val _playbackState = MutableStateFlow(PlaybackState())
@@ -118,6 +119,7 @@ actual class PlayerEngine(
     // next item at the fade point and ramps up, while this headless helper plays the outgoing
     // item's tail and ramps down. Built lazily, only once crossfade is first used.
     private val fadeOutEqualizer = LuminaEqualizerAudioProcessor()
+    private val fadeOutReplayGain = ReplayGainAudioProcessor()
     private var fadeOutPlayer: ExoPlayer? = null
     private var preferredAudioDevice: AudioDeviceInfo? = null
 
@@ -472,6 +474,13 @@ actual class PlayerEngine(
         exoPlayer.skipSilenceEnabled = enabled
     }
 
+    // Each player normalizes the track it is playing, so a crossfade mixes two normalized tracks.
+    actual fun setReplayGain(mode: ReplayGainMode, preampDb: Float, fallbackDb: Float) {
+        val config = ReplayGainConfig(mode, preampDb, fallbackDb)
+        replayGainAudioProcessor.setConfig(config)
+        fadeOutReplayGain.setConfig(config)
+    }
+
     // Runs from the 200 ms ticker: shortly before the fade point, pre-loads the helper with the
     // current item paused at that point (so starting it costs no buffering) and arms a
     // PlayerMessage that fires exactly there.
@@ -512,7 +521,7 @@ actual class PlayerEngine(
 
     private fun buildFadeOutPlayer(): ExoPlayer = ExoPlayer
         .Builder(appContext)
-        .setRenderersFactory(LuminaRenderersFactory(appContext, fadeOutEqualizer))
+        .setRenderersFactory(LuminaRenderersFactory(appContext, fadeOutEqualizer, fadeOutReplayGain))
         .build()
         .also {
             it.setPreferredAudioDevice(preferredAudioDevice)
