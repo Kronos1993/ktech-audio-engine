@@ -95,6 +95,10 @@ actual class PlayerEngine {
     private val _playbackState = MutableStateFlow(PlaybackState())
     actual val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
 
+    // Lyric line shown in place of the artist, and the track it was set for.
+    private var lyricLine: String? = null
+    private var lyricLineUri: String? = null
+
     // Ticks every 200ms independently of playbackState - see the Android actual's matching
     // field for the full rationale.
     private val _positionMs = MutableStateFlow(0L)
@@ -342,9 +346,11 @@ actual class PlayerEngine {
             MPNowPlayingInfoCenter.defaultCenter().nowPlayingInfo = null
             return
         }
+        // The override only applies to the track it was set for, so a track change drops it.
+        val artist = lyricLine?.takeIf { lyricLineUri == track.uri } ?: track.artist
         val info = buildMap<Any?, Any?> {
             put(MPMediaItemPropertyTitle, track.title)
-            track.artist?.let { put(MPMediaItemPropertyArtist, it) }
+            artist?.let { put(MPMediaItemPropertyArtist, it) }
             track.album?.let { put(MPMediaItemPropertyAlbumTitle, it) }
             put(MPMediaItemPropertyPlaybackDuration, (state.durationMs ?: 0L) / 1000.0)
             put(MPNowPlayingInfoPropertyElapsedPlaybackTime, _positionMs.value / 1000.0)
@@ -563,6 +569,12 @@ actual class PlayerEngine {
         }
         ReplayGain.parseTags(entries)
     }.getOrDefault(ReplayGainTags.NONE)
+
+    actual fun setNowPlayingLyricLine(line: String?) {
+        lyricLine = line
+        lyricLineUri = _playbackState.value.currentTrack?.uri
+        updateNowPlayingInfo()
+    }
 
     actual fun release() {
         commandCenter.playCommand.removeTarget(null)

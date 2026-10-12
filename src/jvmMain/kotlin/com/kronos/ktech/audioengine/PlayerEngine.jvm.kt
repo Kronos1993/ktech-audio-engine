@@ -50,6 +50,10 @@ actual class PlayerEngine {
     private val _playbackState = MutableStateFlow(PlaybackState())
     actual val playbackState: StateFlow<PlaybackState> = _playbackState.asStateFlow()
 
+    // Lyric line shown in place of the artist, and the track it was set for.
+    private var lyricLine: String? = null
+    private var lyricLineUri: String? = null
+
     // Updated on every decoded audio frame (far more often than 200ms) independently of
     // playbackState - see the Android actual's matching field for the full rationale.
     private val _positionMs = MutableStateFlow(0L)
@@ -132,7 +136,8 @@ actual class PlayerEngine {
         }
         PlayerEngineJniBridge.nativeUpdateNowPlaying(
             title = track.title,
-            artist = track.artist,
+            // The override only applies to the track it was set for, so a track change drops it.
+            artist = lyricLine?.takeIf { lyricLineUri == track.uri } ?: track.artist,
             album = track.album,
             artworkPath = track.artworkUri?.let { resolveMediaPath(it) },
             durationMs = state.durationMs ?: 0L,
@@ -281,6 +286,12 @@ actual class PlayerEngine {
     // Read by every open PcmSource on its next decoded chunk.
     actual fun setReplayGain(mode: ReplayGainMode, preampDb: Float, fallbackDb: Float) {
         replayGainConfig = ReplayGainConfig(mode, preampDb, fallbackDb)
+    }
+
+    actual fun setNowPlayingLyricLine(line: String?) {
+        lyricLine = line
+        lyricLineUri = _playbackState.value.currentTrack?.uri
+        syncNowPlaying()
     }
 
     actual fun release() {

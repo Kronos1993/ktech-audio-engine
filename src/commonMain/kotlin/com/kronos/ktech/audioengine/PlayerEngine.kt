@@ -135,6 +135,15 @@ expect class PlayerEngine {
      */
     fun setReplayGain(mode: ReplayGainMode, preampDb: Float, fallbackDb: Float)
 
+    /**
+     * Shows [line] (e.g. the current lyric line) in place of the artist in the system now-playing
+     * surfaces: the Android media notification and lock screen, the iOS lock screen and Control
+     * Center, and the macOS/Windows media controls. The title is unchanged. `null` restores the
+     * artist. The override applies only to the track that is current when this is called, and it
+     * is dropped automatically when the current track changes.
+     */
+    fun setNowPlayingLyricLine(line: String?)
+
     /** Releases all underlying platform player resources. The engine must not be used afterward. */
     fun release()
 }

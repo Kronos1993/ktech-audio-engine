@@ -111,6 +111,9 @@ actual class PlayerEngine(
         }
 
     private var queueTracks: List<Track> = emptyList()
+
+    // Lyric line shown in place of the artist, tagged with the queue item it was applied to.
+    private var lyricLineOverride: LyricLineOverride? = null
     private var volume: Float = 1f
     private var crossfadeMs: Long = 0L
     private var playbackSpeed: Float = 1f
@@ -201,6 +204,7 @@ actual class PlayerEngine(
                             current.copy(currentIndex = newIndex, currentTrack = newTrack, durationMs = newDuration)
                         }
                     }
+                    if (lyricLineOverride?.matches(newIndex, newTrack) == false) restoreLyricLineItem()
                     ensureVisualizer()
                     planCrossfadeIfDue()
                     delay(200)
@@ -294,6 +298,7 @@ actual class PlayerEngine(
     ) {
         cancelCrossfade()
         queueTracks = tracks
+        lyricLineOverride = null
         val mediaItems =
             tracks.map { track ->
                 MediaItem
@@ -594,6 +599,35 @@ actual class PlayerEngine(
         ignoreNextSeekDiscontinuity = false
     }
 
+    actual fun setNowPlayingLyricLine(line: String?) {
+        scope.launch {
+            val index = exoPlayer.currentMediaItemIndex
+            val track = queueTracks.getOrNull(index)
+            val current = lyricLineOverride
+            if (current != null && (line == null || !current.matches(index, track))) restoreLyricLineItem()
+            if (line == null || track == null || index >= exoPlayer.mediaItemCount) return@launch
+            if (lyricLineOverride?.line == line) return@launch
+            lyricLineOverride = LyricLineOverride(index, track.uri, line)
+            setItemArtist(index, line)
+        }
+    }
+
+    // Puts the real artist back on the item the override was applied to, if it is still there.
+    private fun restoreLyricLineItem() {
+        val override = lyricLineOverride ?: return
+        lyricLineOverride = null
+        val track = queueTracks.getOrNull(override.index) ?: return
+        if (track.uri == override.uri && override.index < exoPlayer.mediaItemCount) setItemArtist(override.index, track.artist)
+    }
+
+    // Same URI, so ExoPlayer applies it as a metadata-only update without re-preparing; the
+    // session and notification pick it up from the timeline change.
+    private fun setItemArtist(index: Int, artist: String?) {
+        val item = exoPlayer.getMediaItemAt(index)
+        val metadata = item.mediaMetadata.buildUpon().setArtist(artist).build()
+        exoPlayer.replaceMediaItem(index, item.buildUpon().setMediaMetadata(metadata).build())
+    }
+
     actual fun release() {
         audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
         tickerJob?.cancel()
@@ -604,4 +638,12 @@ actual class PlayerEngine(
         exoPlayer.release()
         runCatching { appContext.stopService(Intent(appContext, PlaybackService::class.java)) }
     }
+}
+
+private data class LyricLineOverride(
+    val index: Int,
+    val uri: String,
+    val line: String,
+) {
+    fun matches(index: Int, track: Track?): Boolean = this.index == index && uri == track?.uri
 }

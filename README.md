@@ -169,6 +169,11 @@ if (playerEngine.supportsSkipSilence) playerEngine.setSkipSilenceEnabled(true)
 // at fallbackDb. A peak tag caps the gain so the track never clips. Independent of setVolume.
 playerEngine.setReplayGain(ReplayGainMode.ALBUM, preampDb = 0f, fallbackDb = -6f)
 
+// Shows a line (e.g. the current lyric) in place of the artist on the system now-playing
+// surfaces (Android notification/lock screen, iOS lock screen, macOS/Windows media controls).
+// null restores the artist; the override is dropped automatically when the track changes.
+playerEngine.setNowPlayingLyricLine("Is this the real life?")
+
 // Call this once, when your app is done with playback entirely (not on every screen exit) -
 // it tears down the underlying platform player and the engine can't be used again afterward.
 playerEngine.release()
