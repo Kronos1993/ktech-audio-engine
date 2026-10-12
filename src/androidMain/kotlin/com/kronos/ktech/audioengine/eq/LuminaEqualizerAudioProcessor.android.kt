@@ -14,12 +14,17 @@ import java.nio.ByteOrder
 // android.media.audiofx.Equalizer, whose band count/center frequencies are device/hardware-
 // dependent (real-audio-equalizer proposal.md §2). One EqualizerChain instance per audio
 // channel - interleaved multi-channel PCM would otherwise corrupt a single shared filter's
-// internal (z1/z2) state by alternating unrelated channels' samples through it.
+// internal (z1/z2) state by alternating unrelated channels' samples through it. Stereo widening
+// runs after the chains, on whole frames, and only for 2-channel audio.
 @OptIn(UnstableApi::class)
 class LuminaEqualizerAudioProcessor : BaseAudioProcessor() {
     private var channels: List<EqualizerChain> = emptyList()
+    private val widener = StereoWidener()
     private var enabled = false
     private var gainsDb = FloatArray(EqualizerBands.COUNT)
+    private var preampDb = 0f
+    private var bassBoostDb = 0f
+    private var scratch = ShortArray(0)
 
     fun setEnabled(value: Boolean) {
         enabled = value
@@ -31,6 +36,20 @@ class LuminaEqualizerAudioProcessor : BaseAudioProcessor() {
         channels.forEach { it.setBandGains(gainsDb) }
     }
 
+    fun setPreampDb(db: Float) {
+        preampDb = db
+        channels.forEach { it.setPreampDb(db) }
+    }
+
+    fun setBassBoostDb(db: Float) {
+        bassBoostDb = db
+        channels.forEach { it.setBassBoostDb(db) }
+    }
+
+    fun setStereoWidthPercent(percent: Float) {
+        widener.setWidthPercent(percent)
+    }
+
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
             throw AudioProcessor.UnhandledAudioFormatException(inputAudioFormat)
@@ -39,6 +58,8 @@ class LuminaEqualizerAudioProcessor : BaseAudioProcessor() {
             EqualizerChain().also { chain ->
                 chain.setEnabled(enabled)
                 chain.setBandGains(gainsDb)
+                chain.setPreampDb(preampDb)
+                chain.setBassBoostDb(bassBoostDb)
             }
         }
         return inputAudioFormat
@@ -54,13 +75,17 @@ class LuminaEqualizerAudioProcessor : BaseAudioProcessor() {
         outputBuffer.order(ByteOrder.nativeOrder())
         val sampleRateHz = inputAudioFormat.sampleRate
         val channelCount = channels.size
+        val sampleCount = remaining / 2
+        if (scratch.size < sampleCount) scratch = ShortArray(sampleCount)
+        val samples = scratch
+        var count = 0
         var channelIndex = 0
-        while (inputBuffer.hasRemaining()) {
-            val sample = inputBuffer.getShort()
-            val processed = channels[channelIndex].processSample(sampleRateHz, sample)
-            outputBuffer.putShort(processed)
+        while (inputBuffer.remaining() >= 2) {
+            samples[count++] = channels[channelIndex].processSample(sampleRateHz, inputBuffer.getShort())
             channelIndex = (channelIndex + 1) % channelCount
         }
+        if (enabled && channelCount == 2) widener.processInterleaved(samples, count)
+        for (i in 0 until count) outputBuffer.putShort(samples[i])
         outputBuffer.flip()
     }
 

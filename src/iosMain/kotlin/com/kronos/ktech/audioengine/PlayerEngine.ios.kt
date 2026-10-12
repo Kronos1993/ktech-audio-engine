@@ -7,6 +7,7 @@ import com.kronos.ktech.audioengine.domain.PlaybackState
 import com.kronos.ktech.audioengine.domain.PlaybackStatus
 import com.kronos.ktech.audioengine.domain.RepeatMode
 import com.kronos.ktech.audioengine.domain.Track
+import com.kronos.ktech.audioengine.eq.EqualizerChain
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.get
 import kotlinx.coroutines.CoroutineScope
@@ -38,6 +39,7 @@ import platform.AVFAudio.AVAudioSessionInterruptionTypeEnded
 import platform.AVFAudio.AVAudioSessionInterruptionTypeKey
 import platform.AVFAudio.AVAudioUnitEQ
 import platform.AVFAudio.AVAudioUnitEQFilterParameters
+import platform.AVFAudio.AVAudioUnitEQFilterTypeLowShelf
 import platform.AVFAudio.AVAudioUnitEQFilterTypeParametric
 import platform.AVFAudio.AVAudioUnitTimePitch
 import platform.AVFAudio.setActive
@@ -114,7 +116,8 @@ actual class PlayerEngine {
     private var playerNode = AVAudioPlayerNode()
     private var idleNode = AVAudioPlayerNode()
     private val submixer = AVAudioMixerNode()
-    private val eqNode = AVAudioUnitEQ(numberOfBands = EqualizerBands.COUNT.toULong())
+    // The 10 peaking bands plus a bass-boost low shelf at index BASS_SHELF_BAND; globalGain is the pre-amp.
+    private val eqNode = AVAudioUnitEQ(numberOfBands = (EqualizerBands.COUNT + 1).toULong())
 
     // ReplayGain: one gain unit after each player node (node volume can't exceed 1.0 and
     // already carries the user volume and crossfade ramp). Each unit swaps roles with its node.
@@ -249,6 +252,11 @@ actual class PlayerEngine {
             band.bandwidth = 1.0f
             band.gain = 0f
         }
+        val bassShelf = bands[BASS_SHELF_BAND] as AVAudioUnitEQFilterParameters
+        bassShelf.filterType = AVAudioUnitEQFilterTypeLowShelf
+        bassShelf.frequency = EqualizerChain.BASS_SHELF_HZ.toFloat()
+        bassShelf.gain = 0f
+        bassShelf.bypass = true
     }
 
     // AVAudioPlayerNode has no built-in metering (unlike AVAudioPlayer.meteringEnabled, used
@@ -464,6 +472,22 @@ actual class PlayerEngine {
             (bands[i] as AVAudioUnitEQFilterParameters).gain = gainsDb[i]
         }
     }
+
+    // AVAudioUnitEQ.globalGain range: -96..+24 dB.
+    actual fun setEqualizerPreamp(preampDb: Float) {
+        eqNode.globalGain = preampDb.coerceIn(-96f, 24f)
+    }
+
+    actual fun setBassBoost(gainDb: Float) {
+        val shelf = eqNode.bands[BASS_SHELF_BAND] as AVAudioUnitEQFilterParameters
+        shelf.gain = gainDb
+        shelf.bypass = gainDb == 0f
+    }
+
+    // No AVAudioEngine node does mid/side widening.
+    actual val supportsStereoWidening: Boolean = false
+
+    actual fun setStereoWidth(percent: Float) = Unit
 
     actual fun setCrossfadeDuration(durationMs: Long) {
         crossfadeMs = durationMs.coerceAtLeast(0L)
@@ -947,6 +971,7 @@ private class PlannedFade(val index: Int, val startAtMs: Long)
 private const val FADE_STEP_MS = 50L
 
 private const val GAIN_RAMP_STEPS = 5
+private val BASS_SHELF_BAND = EqualizerBands.COUNT
 private const val GAIN_RAMP_STEP_MS = 10L
 
 // CMTime timescale for seeks: 1000 = millisecond resolution.

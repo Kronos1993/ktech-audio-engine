@@ -455,6 +455,23 @@ actual class PlayerEngine(
         fadeOutEqualizer.setBandGains(gainsDb)
     }
 
+    actual fun setEqualizerPreamp(preampDb: Float) {
+        equalizerAudioProcessor.setPreampDb(preampDb)
+        fadeOutEqualizer.setPreampDb(preampDb)
+    }
+
+    actual fun setBassBoost(gainDb: Float) {
+        equalizerAudioProcessor.setBassBoostDb(gainDb)
+        fadeOutEqualizer.setBassBoostDb(gainDb)
+    }
+
+    actual val supportsStereoWidening: Boolean = true
+
+    actual fun setStereoWidth(percent: Float) {
+        equalizerAudioProcessor.setStereoWidthPercent(percent)
+        fadeOutEqualizer.setStereoWidthPercent(percent)
+    }
+
     actual fun setCrossfadeDuration(durationMs: Long) {
         crossfadeMs = durationMs.coerceAtLeast(0L)
         if (crossfadeMs == 0L) cancelCrossfade()

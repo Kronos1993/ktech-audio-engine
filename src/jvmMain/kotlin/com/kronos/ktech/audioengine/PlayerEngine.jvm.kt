@@ -2,6 +2,7 @@ package com.kronos.ktech.audioengine
 
 import co.touchlab.kermit.Logger
 import com.kronos.ktech.audioengine.eq.EqualizerChain
+import com.kronos.ktech.audioengine.eq.StereoWidener
 import com.kronos.ktech.audioengine.domain.AudioOutputDevice
 import com.kronos.ktech.audioengine.domain.AudioOutputDeviceType
 import com.kronos.ktech.audioengine.domain.EqualizerBands
@@ -97,6 +98,9 @@ actual class PlayerEngine {
     private var equalizerEnabled = false
     private var equalizerGainsDb = FloatArray(EqualizerBands.COUNT)
     private var equalizerChannels: List<EqualizerChain> = emptyList()
+    private var equalizerPreampDb = 0f
+    private var bassBoostDb = 0f
+    private val stereoWidener = StereoWidener()
 
     init {
         scope.launch {
@@ -243,6 +247,22 @@ actual class PlayerEngine {
         equalizerChannels.forEach { it.setBandGains(equalizerGainsDb) }
     }
 
+    actual fun setEqualizerPreamp(preampDb: Float) {
+        equalizerPreampDb = preampDb
+        equalizerChannels.forEach { it.setPreampDb(preampDb) }
+    }
+
+    actual fun setBassBoost(gainDb: Float) {
+        bassBoostDb = gainDb
+        equalizerChannels.forEach { it.setBassBoostDb(gainDb) }
+    }
+
+    actual val supportsStereoWidening: Boolean = true
+
+    actual fun setStereoWidth(percent: Float) {
+        stereoWidener.setWidthPercent(percent)
+    }
+
     actual fun setCrossfadeDuration(durationMs: Long) {
         crossfadeMs = durationMs.coerceAtLeast(0L)
     }
@@ -359,6 +379,8 @@ actual class PlayerEngine {
                     EqualizerChain().also { chain ->
                         chain.setEnabled(equalizerEnabled)
                         chain.setBandGains(equalizerGainsDb)
+                        chain.setPreampDb(equalizerPreampDb)
+                        chain.setBassBoostDb(bassBoostDb)
                     }
                 }
                 // Reads the *current* isPaused flag, not the autoplay param this
@@ -476,6 +498,7 @@ actual class PlayerEngine {
                         for (i in samples.indices) {
                             samples[i] = equalizerChannels[i % channelCount].processSample(sampleRate, samples[i])
                         }
+                        if (equalizerEnabled && channelCount == 2) stereoWidener.processInterleaved(samples)
                     }
 
                     samples = tempo.process(samples, playbackSpeed)

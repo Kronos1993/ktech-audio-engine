@@ -4,12 +4,20 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.math.sqrt
 
-// A single peaking-EQ biquad, RBJ Audio EQ Cookbook coefficients (https://www.w3.org/TR/audio-eq-cookbook/,
-// peakingEQ section - a standard, publicly documented DSP formula, not derived from any one
-// product's implementation), Direct Form II Transpose. Shared by every platform's real-EQ
+// A single biquad, RBJ Audio EQ Cookbook coefficients (https://www.w3.org/TR/audio-eq-cookbook/,
+// peakingEQ and lowShelf sections - a standard, publicly documented DSP formula, not derived from
+// any one product's implementation), Direct Form II Transpose. Shared by every platform's real-EQ
 // integration so Android/Desktop/iOS all shape the same frequency the same way.
-class BiquadFilter(private val q: Float = 1.0f) {
+// Default Q is one octave (sqrt 2), matching iOS AVAudioUnitEQ bandwidth = 1.0 and AutoEq's
+// fixed-band profiles.
+class BiquadFilter(
+    private val q: Float = ONE_OCTAVE_Q,
+    private val type: Type = Type.PEAKING,
+) {
+    enum class Type { PEAKING, LOW_SHELF }
+
     private var b0 = 1f
     private var b1 = 0f
     private var b2 = 0f
@@ -46,14 +54,30 @@ class BiquadFilter(private val q: Float = 1.0f) {
         val amplitude = 10.0.pow(gainDb / 40.0).toFloat()
         val w0 = (2.0 * PI * frequencyHz / sampleRateHz).toFloat()
         val cosW0 = cos(w0)
-        val alpha = sin(w0) / (2f * q)
-
-        val a0 = 1f + alpha / amplitude
-        b0 = (1f + alpha * amplitude) / a0
-        b1 = (-2f * cosW0) / a0
-        b2 = (1f - alpha * amplitude) / a0
-        a1 = (-2f * cosW0) / a0
-        a2 = (1f - alpha / amplitude) / a0
+        when (type) {
+            Type.PEAKING -> {
+                val alpha = sin(w0) / (2f * q)
+                val a0 = 1f + alpha / amplitude
+                b0 = (1f + alpha * amplitude) / a0
+                b1 = (-2f * cosW0) / a0
+                b2 = (1f - alpha * amplitude) / a0
+                a1 = (-2f * cosW0) / a0
+                a2 = (1f - alpha / amplitude) / a0
+            }
+            Type.LOW_SHELF -> {
+                // Shelf slope S = 1 (alpha = sin(w0) / sqrt 2); q is unused.
+                val alpha = sin(w0) / sqrt(2f)
+                val twoSqrtAAlpha = 2f * sqrt(amplitude) * alpha
+                val ap1 = amplitude + 1f
+                val am1 = amplitude - 1f
+                val a0 = ap1 + am1 * cosW0 + twoSqrtAAlpha
+                b0 = amplitude * (ap1 - am1 * cosW0 + twoSqrtAAlpha) / a0
+                b1 = 2f * amplitude * (am1 - ap1 * cosW0) / a0
+                b2 = amplitude * (ap1 - am1 * cosW0 - twoSqrtAAlpha) / a0
+                a1 = -2f * (am1 + ap1 * cosW0) / a0
+                a2 = (ap1 + am1 * cosW0 - twoSqrtAAlpha) / a0
+            }
+        }
     }
 
     fun process(input: Float): Float {
@@ -68,9 +92,11 @@ class BiquadFilter(private val q: Float = 1.0f) {
         z2 = 0f
     }
 
-    private companion object {
+    companion object {
+        const val ONE_OCTAVE_Q = 1.4142135f
+
         // Bands at or above this fraction of the sample rate are bypassed; the stream has no
-        // content there, and the peaking formula becomes unstable as w0 approaches pi.
-        const val NYQUIST_GUARD_RATIO = 0.45f
+        // content there, and the formulas become unstable as w0 approaches pi.
+        private const val NYQUIST_GUARD_RATIO = 0.45f
     }
 }

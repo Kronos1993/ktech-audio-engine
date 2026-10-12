@@ -145,6 +145,13 @@ playerEngine.selectOutputDevice(deviceId = "some-device-id")
 playerEngine.setEqualizerEnabled(true)
 playerEngine.setEqualizerBands(gainsDb = FloatArray(EqualizerBands.COUNT) { 0f })
 
+// Equalizer extras, all bypassed while the equalizer is disabled: a pre-amp before the bands
+// (negative = headroom), a 100 Hz bass-boost low shelf, and mid/side stereo widening (0..100%,
+// Android and Desktop only).
+playerEngine.setEqualizerPreamp(preampDb = -6f)
+playerEngine.setBassBoost(gainDb = 4f)
+if (playerEngine.supportsStereoWidening) playerEngine.setStereoWidth(percent = 30f)
+
 // Track changes are gapless on every platform. Optionally crossfade natural end-of-track
 // transitions (0 = off, the default). Manual skips, seeks, repeat-one and http(s) streams always
 // cut, and the fade never exceeds half of either track.

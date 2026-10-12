@@ -85,6 +85,27 @@ expect class PlayerEngine {
     fun setEqualizerBands(gainsDb: FloatArray)
 
     /**
+     * Sets the equalizer pre-amp in dB, applied before the bands; `0f` (the default) for none.
+     * Use a negative value to leave headroom for boosted bands. Bypassed while the equalizer is disabled.
+     */
+    fun setEqualizerPreamp(preampDb: Float)
+
+    /**
+     * Sets the bass boost in dB, a low shelf at 100 Hz after the bands; `0f` (the default) for none.
+     * Bypassed while the equalizer is disabled.
+     */
+    fun setBassBoost(gainDb: Float)
+
+    /** Whether [setStereoWidth] has any effect on this platform. */
+    val supportsStereoWidening: Boolean
+
+    /**
+     * Sets mid/side stereo widening from `0f` (the default, off) to `100f` (side doubled), stereo
+     * sources only. Bypassed while the equalizer is disabled. A no-op where [supportsStereoWidening] is false.
+     */
+    fun setStereoWidth(percent: Float)
+
+    /**
      * Sets the crossfade length in milliseconds, `0` (the default) to turn it off. Applies only to
      * natural end-of-track transitions between two different local tracks; manual skips, seeks,
      * repeat-one and http(s) streams always cut. Track changes are gapless either way.
