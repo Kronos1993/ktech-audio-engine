@@ -72,8 +72,10 @@ import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSNumber
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSURL
+import platform.MediaPlayer.MPMediaItemArtwork
 import platform.MediaPlayer.MPMediaItemPropertyAlbumTitle
 import platform.MediaPlayer.MPMediaItemPropertyArtist
+import platform.MediaPlayer.MPMediaItemPropertyArtwork
 import platform.MediaPlayer.MPMediaItemPropertyPlaybackDuration
 import platform.MediaPlayer.MPMediaItemPropertyTitle
 import platform.MediaPlayer.MPNowPlayingInfoCenter
@@ -81,6 +83,7 @@ import platform.MediaPlayer.MPNowPlayingInfoPropertyElapsedPlaybackTime
 import platform.MediaPlayer.MPNowPlayingInfoPropertyPlaybackRate
 import platform.MediaPlayer.MPRemoteCommandCenter
 import platform.MediaPlayer.MPRemoteCommandHandlerStatusSuccess
+import platform.UIKit.UIImage
 import kotlin.math.abs
 import kotlin.math.log10
 
@@ -98,6 +101,10 @@ actual class PlayerEngine {
     // Lyric line shown in place of the artist, and the track it was set for.
     private var lyricLine: String? = null
     private var lyricLineUri: String? = null
+
+    // Now-playing artwork, decoded once per artwork URI rather than on every 200ms tick.
+    private var nowPlayingArtworkUri: String? = null
+    private var nowPlayingArtwork: MPMediaItemArtwork? = null
 
     // Ticks every 200ms independently of playbackState - see the Android actual's matching
     // field for the full rationale.
@@ -236,6 +243,11 @@ actual class PlayerEngine {
             skipPrevious()
             MPRemoteCommandHandlerStatusSuccess
         }
+        // Single-button remotes (headphones, some watch faces) send toggle instead of play/pause.
+        commandCenter.togglePlayPauseCommand.addTargetWithHandler { _ ->
+            if (_playbackState.value.status == PlaybackStatus.PLAYING) pause() else play()
+            MPRemoteCommandHandlerStatusSuccess
+        }
 
         tickerJob = scope.launch {
             while (isActive) {
@@ -355,8 +367,21 @@ actual class PlayerEngine {
             put(MPMediaItemPropertyPlaybackDuration, (state.durationMs ?: 0L) / 1000.0)
             put(MPNowPlayingInfoPropertyElapsedPlaybackTime, _positionMs.value / 1000.0)
             put(MPNowPlayingInfoPropertyPlaybackRate, if (state.status == PlaybackStatus.PLAYING) playbackSpeed.toDouble() else 0.0)
+            artworkFor(track.artworkUri)?.let { put(MPMediaItemPropertyArtwork, it) }
         }
         MPNowPlayingInfoCenter.defaultCenter().nowPlayingInfo = info
+        // Skipping past a queue edge stops playback, so remotes must show those buttons disabled.
+        commandCenter.nextTrackCommand.enabled = nextIndex(state, 1) != null
+        commandCenter.previousTrackCommand.enabled = nextIndex(state, -1) != null
+    }
+
+    private fun artworkFor(uri: String?): MPMediaItemArtwork? {
+        if (uri != nowPlayingArtworkUri) {
+            nowPlayingArtworkUri = uri
+            val image = uri?.let { NSURL.URLWithString(it)?.path }?.let { UIImage.imageWithContentsOfFile(it) }
+            nowPlayingArtwork = image?.let { MPMediaItemArtwork(boundsSize = it.size, requestHandler = { _ -> it }) }
+        }
+        return nowPlayingArtwork
     }
 
     actual fun setQueue(tracks: List<Track>, startIndex: Int) {
