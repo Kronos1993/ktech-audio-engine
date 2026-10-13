@@ -43,7 +43,7 @@ kotlin {
             implementation(libs.koin.android)
             implementation(libs.androidx.core.ktx)
             implementation(libs.media3.exoplayer)
-            implementation(libs.media3.session)
+            api(libs.media3.session)
         }
         commonMain.dependencies {
             api(libs.koin.core)

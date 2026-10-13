@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.OptIn
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -64,6 +65,12 @@ private val RELEVANT_OUTPUT_TYPES = setOf(
     AudioDeviceInfo.TYPE_HDMI_ARC,
 )
 
+private val MUSIC_AUDIO_ATTRIBUTES = AudioAttributes
+    .Builder()
+    .setUsage(C.USAGE_MEDIA)
+    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+    .build()
+
 actual class PlayerEngine(
     private val appContext: Context,
 ) {
@@ -73,6 +80,8 @@ actual class PlayerEngine(
     internal val exoPlayer: ExoPlayer = ExoPlayer
         .Builder(appContext)
         .setRenderersFactory(LuminaRenderersFactory(appContext, equalizerAudioProcessor, replayGainAudioProcessor))
+        // Media focus: pauses/ducks for calls and other apps, and makes Android Auto route this audio to the car.
+        .setAudioAttributes(MUSIC_AUDIO_ATTRIBUTES, true)
         .build()
 
     private val _playbackState = MutableStateFlow(PlaybackState())
@@ -137,13 +146,10 @@ actual class PlayerEngine(
     private var visualizer: Visualizer? = null
     private var visualizerSessionId: Int = 0
     private var tickerJob: Job? = null
-    // Deliberately NOT tracked with a "have I already started it" boolean - PlaybackService
-    // can die independently of this singleton (e.g. the user swiping away its notification,
-    // or the system reclaiming it under memory pressure) with no callback here to reset such
-    // a flag, which used to leave ensureServiceStarted() silently skipping the restart on
-    // every later play() and permanently orphaning the notification/session. Always calling
-    // startForegroundService() instead is the correct fix: Android no-ops it cheaply
-    // (onStartCommand only, no onCreate/session rebuild) when the service is already alive.
+    // Liveness comes from PlaybackService's own onCreate/onDestroy, not a flag kept here: the
+    // service can die independently of this singleton (notification swipe, memory pressure).
+    // A live service must not get startForegroundService(): it has no startForeground() to
+    // match it unless playback starts, and an unmatched call is an ANR.
 
     init {
         audioManager.registerAudioDeviceCallback(audioDeviceCallback, null)
@@ -303,6 +309,9 @@ actual class PlayerEngine(
             tracks.map { track ->
                 MediaItem
                     .Builder()
+                    // Controllers replay what they saw by media id (Assistant suggestions,
+                    // "For you"), so it must name the track, not stay empty.
+                    .setMediaId(track.uri)
                     .setUri(track.uri)
                     .setMediaMetadata(
                         MediaMetadata
@@ -332,6 +341,7 @@ actual class PlayerEngine(
     }
 
     private fun ensureServiceStarted() {
+        if (PlaybackService.isAlive) return
         runCatching {
             appContext.startForegroundService(Intent(appContext, PlaybackService::class.java))
         }.onFailure {
@@ -544,6 +554,8 @@ actual class PlayerEngine(
     private fun buildFadeOutPlayer(): ExoPlayer = ExoPlayer
         .Builder(appContext)
         .setRenderersFactory(LuminaRenderersFactory(appContext, fadeOutEqualizer, fadeOutReplayGain))
+        // Same attributes as the main player, without focus handling so it never takes focus from it.
+        .setAudioAttributes(MUSIC_AUDIO_ATTRIBUTES, false)
         .build()
         .also {
             it.setPreferredAudioDevice(preferredAudioDevice)

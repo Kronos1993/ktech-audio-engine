@@ -181,6 +181,44 @@ playerEngine.release()
 
 See `PlayerEngine`'s KDoc for the full API and per-member detail.
 
+### Android Auto / media browsers (Android only)
+
+`PlaybackService` is a Media3 `MediaLibraryService`. To show a browse tree in Android Auto (or any
+`MediaBrowser`), bind a `MediaBrowseProvider` in Koin. The service delegates the library callbacks
+(root, children, search, `onSetMediaItems`, playback resumption, …) to it, and keeps connection
+handling and its notification buttons. With no binding, nothing changes.
+
+A controller's set/add of media items reaches `onSetMediaItemsRequest` / `onAddMediaItemsRequest`
+on the main thread before touching the player. Return `true` after applying them yourself, normally
+with `PlayerEngine.setQueue`, so the engine's queue and state stay in sync.
+
+Every session controller's play request (`play()`, or `playWhenReady` set to `true`) first asks
+`isPlaybackAllowed(session, controller)`; return `false` to ignore it, for example to lock a car
+connection. The app's own UI plays through `PlayerEngine` and never reaches it. `onPostConnect` and
+`onDisconnected` are forwarded too, so a provider can track which controllers are connected.
+
+Queue items carry the track uri as their media id, so a controller that replays what it saw (an
+Assistant suggestion, Android Auto's "For you") sends an id the provider can resolve. The player
+also takes media audio focus: it pauses or ducks for calls and other apps.
+
+```kotlin
+single<MediaBrowseProvider> { MyBrowseProvider(/* your library */) }
+```
+
+For Android Auto, also export the service with both browse actions and declare the car app:
+
+```xml
+<service android:name="com.kronos.ktech.audioengine.PlaybackService"
+    android:exported="true" android:foregroundServiceType="mediaPlayback">
+    <intent-filter>
+        <action android:name="androidx.media3.session.MediaLibraryService" />
+        <action android:name="android.media.browse.MediaBrowserService" />
+    </intent-filter>
+</service>
+<meta-data android:name="com.google.android.gms.car.application"
+    android:resource="@xml/automotive_app_desc" />
+```
+
 ## Known limitation: native now-playing integration is not portable out of the box
 
 On Desktop, macOS Control Center and Windows SMTC integration is implemented via two standalone

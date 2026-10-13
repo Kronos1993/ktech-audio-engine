@@ -9,12 +9,19 @@ import android.os.Build
 import android.os.Bundle
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.media3.common.C
+import androidx.media3.common.ForwardingPlayer
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.CommandButton
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaLibraryService.LibraryParams
+import androidx.media3.session.MediaLibraryService.MediaLibrarySession
 import androidx.media3.session.MediaSession
-import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.kronos.ktech.audioengine.domain.RepeatMode
@@ -26,6 +33,7 @@ import com.kronos.ktech.audioengine.generated.resources.playback_notification_ti
 import com.kronos.ktech.audioengine.generated.resources.playback_repeat_button_label
 import com.kronos.ktech.audioengine.generated.resources.playback_shuffle_button_label
 import org.jetbrains.compose.resources.getString
+import org.koin.android.ext.android.getKoin
 import org.koin.android.ext.android.inject
 
 private const val NOTIFICATION_CHANNEL_ID = "playback_channel"
@@ -40,9 +48,10 @@ private const val ACTION_CYCLE_REPEAT = "com.kronos.multiplatform.lumina.sound.C
 // the other way), so this is the only channel connecting the two.
 const val EXTRA_OPEN_NOW_PLAYING = "com.kronos.multiplatform.lumina.sound.OPEN_NOW_PLAYING"
 
-class PlaybackService : MediaSessionService() {
+class PlaybackService : MediaLibraryService() {
     private val playerEngine: PlayerEngine by inject()
-    private var mediaSession: MediaSession? = null
+    private var browseProvider: MediaBrowseProvider? = null
+    private var mediaSession: MediaLibrarySession? = null
     private var shuffleButtonLabel: String = "Shuffle"
     private var repeatButtonLabel: String = "Repeat"
 
@@ -65,6 +74,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
+        isAlive = true
         // Kept synchronous (a blocking runBlocking read of composeResources' bundled, local
         // string assets - no network/disk contention, effectively instant) rather than a
         // launched coroutine: this whole method must complete atomically before Android's
@@ -78,8 +88,8 @@ class PlaybackService : MediaSessionService() {
         shuffleButtonLabel = runBlocking { getString(Res.string.playback_shuffle_button_label) }
         repeatButtonLabel = runBlocking { getString(Res.string.playback_repeat_button_label) }
 
-        val session = MediaSession.Builder(this, playerEngine.exoPlayer)
-            .setCallback(PlaybackSessionCallback())
+        browseProvider = getKoin().getOrNull<MediaBrowseProvider>()
+        val session = MediaLibrarySession.Builder(this, buildSessionPlayer(), PlaybackSessionCallback())
             .setMediaButtonPreferences(buildMediaButtonPreferences())
             .apply { buildSessionActivityPendingIntent()?.let { setSessionActivity(it) } }
             .build()
@@ -182,23 +192,26 @@ class PlaybackService : MediaSessionService() {
         else -> RepeatMode.OFF
     }
 
-    // Handles the notification's shuffle/repeat buttons. Routed through custom
-    // SessionCommands (rather than the raw Player.COMMAND_SET_SHUFFLE_MODE /
-    // COMMAND_SET_REPEAT_MODE player commands) so repeat can cycle OFF -> ALL -> ONE ->
-    // OFF - the same order App.kt's onCycleRepeat uses for the in-app button - instead
-    // of relying on unspecified default toggle behavior for a 3-state control.
-    private inner class PlaybackSessionCallback : MediaSession.Callback {
+    private inner class PlaybackSessionCallback : MediaLibrarySession.Callback {
         override fun onConnect(
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
         ): MediaSession.ConnectionResult {
-            val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+            val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
                 .add(SessionCommand(ACTION_TOGGLE_SHUFFLE, Bundle.EMPTY))
                 .add(SessionCommand(ACTION_CYCLE_REPEAT, Bundle.EMPTY))
                 .build()
             return MediaSession.ConnectionResult.AcceptedResultBuilder(session, controller)
                 .setAvailableSessionCommands(sessionCommands)
                 .build()
+        }
+
+        override fun onPostConnect(session: MediaSession, controller: MediaSession.ControllerInfo) {
+            browseProvider?.onPostConnect(session, controller)
+        }
+
+        override fun onDisconnected(session: MediaSession, controller: MediaSession.ControllerInfo) {
+            browseProvider?.onDisconnected(session, controller)
         }
 
         override fun onCustomCommand(
@@ -213,9 +226,167 @@ class PlaybackService : MediaSessionService() {
             }
             return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
         }
+
+        // Library callbacks go to the host's browse tree; without one they keep Media3's defaults.
+
+        override fun onGetLibraryRoot(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<MediaItem>> =
+            browseProvider?.onGetLibraryRoot(session, browser, params)
+                ?: super.onGetLibraryRoot(session, browser, params)
+
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String,
+        ): ListenableFuture<LibraryResult<MediaItem>> =
+            browseProvider?.onGetItem(session, browser, mediaId)
+                ?: super.onGetItem(session, browser, mediaId)
+
+        override fun onGetChildren(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
+            browseProvider?.onGetChildren(session, browser, parentId, page, pageSize, params)
+                ?: super.onGetChildren(session, browser, parentId, page, pageSize, params)
+
+        override fun onSubscribe(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<Void>> =
+            browseProvider?.onSubscribe(session, browser, parentId, params)
+                ?: super.onSubscribe(session, browser, parentId, params)
+
+        override fun onUnsubscribe(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+        ): ListenableFuture<LibraryResult<Void>> =
+            browseProvider?.onUnsubscribe(session, browser, parentId)
+                ?: super.onUnsubscribe(session, browser, parentId)
+
+        override fun onSearch(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<Void>> =
+            browseProvider?.onSearch(session, browser, query, params)
+                ?: super.onSearch(session, browser, query, params)
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
+            browseProvider?.onGetSearchResult(session, browser, query, page, pageSize, params)
+                ?: super.onGetSearchResult(session, browser, query, page, pageSize, params)
+
+        override fun onSetMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+            startIndex: Int,
+            startPositionMs: Long,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+            browseProvider?.onSetMediaItems(mediaSession, controller, mediaItems, startIndex, startPositionMs)
+                ?: super.onSetMediaItems(mediaSession, controller, mediaItems, startIndex, startPositionMs)
+
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+        ): ListenableFuture<MutableList<MediaItem>> =
+            browseProvider?.onAddMediaItems(mediaSession, controller, mediaItems)
+                ?: super.onAddMediaItems(mediaSession, controller, mediaItems)
+
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            isForPlayback: Boolean,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+            browseProvider?.onPlaybackResumption(mediaSession, controller, isForPlayback)
+                ?: super.onPlaybackResumption(mediaSession, controller, isForPlayback)
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+    // Controller-requested set/add calls (e.g. a play started from Android Auto) go to the
+    // browse provider first, so the host can route them through PlayerEngine.setQueue instead
+    // of replacing exoPlayer's items behind the engine. The engine's own calls use exoPlayer
+    // directly and never pass through here.
+    private fun buildSessionPlayer(): Player = object : ForwardingPlayer(playerEngine.exoPlayer) {
+        override fun play() {
+            if (isPlaybackAllowed()) super.play()
+        }
+
+        override fun setPlayWhenReady(playWhenReady: Boolean) {
+            if (!playWhenReady || isPlaybackAllowed()) super.setPlayWhenReady(playWhenReady)
+        }
+
+        private fun isPlaybackAllowed(): Boolean {
+            val session = mediaSession ?: return true
+            val controller = session.controllerForCurrentRequest ?: return true
+            return browseProvider?.isPlaybackAllowed(session, controller) != false
+        }
+
+        override fun setMediaItems(mediaItems: MutableList<MediaItem>) {
+            setMediaItems(mediaItems, true)
+        }
+
+        override fun setMediaItems(mediaItems: MutableList<MediaItem>, resetPosition: Boolean) {
+            if (browseProvider?.onSetMediaItemsRequest(mediaItems, 0, C.TIME_UNSET) != true) {
+                super.setMediaItems(mediaItems, resetPosition)
+            }
+        }
+
+        override fun setMediaItems(mediaItems: MutableList<MediaItem>, startIndex: Int, startPositionMs: Long) {
+            if (browseProvider?.onSetMediaItemsRequest(mediaItems, startIndex, startPositionMs) != true) {
+                super.setMediaItems(mediaItems, startIndex, startPositionMs)
+            }
+        }
+
+        override fun setMediaItem(mediaItem: MediaItem) {
+            setMediaItems(mutableListOf(mediaItem), true)
+        }
+
+        override fun setMediaItem(mediaItem: MediaItem, startPositionMs: Long) {
+            setMediaItems(mutableListOf(mediaItem), 0, startPositionMs)
+        }
+
+        override fun setMediaItem(mediaItem: MediaItem, resetPosition: Boolean) {
+            setMediaItems(mutableListOf(mediaItem), resetPosition)
+        }
+
+        override fun addMediaItems(index: Int, mediaItems: MutableList<MediaItem>) {
+            if (browseProvider?.onAddMediaItemsRequest(index, mediaItems) != true) {
+                super.addMediaItems(index, mediaItems)
+            }
+        }
+
+        override fun addMediaItems(mediaItems: MutableList<MediaItem>) {
+            addMediaItems(mediaItemCount, mediaItems)
+        }
+
+        override fun addMediaItem(index: Int, mediaItem: MediaItem) {
+            addMediaItems(index, mutableListOf(mediaItem))
+        }
+
+        override fun addMediaItem(mediaItem: MediaItem) {
+            addMediaItems(mediaItemCount, mutableListOf(mediaItem))
+        }
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? = mediaSession
 
     override fun onDestroy() {
         playerEngine.exoPlayer.removeListener(playbackListener)
@@ -224,6 +395,16 @@ class PlaybackService : MediaSessionService() {
             session.release()
         }
         mediaSession = null
+        isAlive = false
         super.onDestroy()
+    }
+
+    internal companion object {
+        // Read by PlayerEngine.ensureServiceStarted(). Each startForegroundService() needs a
+        // matching startForeground(), and only onCreate() makes one unconditionally; a live
+        // service is promoted by Media3 itself once playback actually starts.
+        @Volatile
+        var isAlive = false
+            private set
     }
 }
