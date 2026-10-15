@@ -1,6 +1,7 @@
 package com.kronos.ktech.audioengine
 
 import com.kronos.ktech.audioengine.domain.AudioOutputDevice
+import com.kronos.ktech.audioengine.domain.EnqueuePosition
 import com.kronos.ktech.audioengine.domain.EqualizerBands
 import com.kronos.ktech.audioengine.domain.OutputSelectionMode
 import com.kronos.ktech.audioengine.domain.PlaybackState
@@ -168,6 +169,7 @@ actual class PlayerEngine {
     private var transitionPrepared = false
     private var gaplessNext: GaplessNext? = null
     private var plannedFade: PlannedFade? = null
+    private val upNext = UpNext()
     private var fadeJob: Job? = null
     private var fadeOutNode: AVAudioPlayerNode? = null
 
@@ -386,6 +388,7 @@ actual class PlayerEngine {
 
     actual fun setQueue(tracks: List<Track>, startIndex: Int) {
         _positionMs.value = 0L
+        upNext.clear()
         _playbackState.update {
             it.copy(
                 queue = tracks,
@@ -396,6 +399,95 @@ actual class PlayerEngine {
             )
         }
         loadTrack(startIndex, autoplay = false)
+    }
+
+    actual fun enqueue(tracks: List<Track>, position: EnqueuePosition) {
+        if (tracks.isEmpty()) return
+        val state = _playbackState.value
+        if (state.queue.isEmpty()) {
+            setQueue(tracks, 0)
+            return
+        }
+        val at = when (position) {
+            EnqueuePosition.NEXT -> upNext.insertionIndex(state.currentIndex, state.queue.size)
+            EnqueuePosition.END -> state.queue.size
+        }
+        upNext.onInsert(at, tracks.size, asNext = position == EnqueuePosition.NEXT)
+        _playbackState.update {
+            it.copy(
+                queue = it.queue.subList(0, at) + tracks + it.queue.subList(at, it.queue.size),
+                currentIndex = QueueIndex.afterInsert(it.currentIndex, at, tracks.size),
+            )
+        }
+        retargetTransition { QueueIndex.afterInsert(it, at, tracks.size) }
+        updateNowPlayingInfo()
+    }
+
+    actual fun removeFromQueue(indices: Set<Int>) {
+        val state = _playbackState.value
+        val removed = indices.filterTo(mutableSetOf()) { it in state.queue.indices }
+        if (removed.isEmpty()) return
+        val queue = state.queue.filterIndexed { index, _ -> index !in removed }
+        upNext.onRemove(removed)
+        val current = QueueIndex.afterRemove(state.currentIndex, removed)
+        if (current != null) {
+            _playbackState.update { it.copy(queue = queue, currentIndex = current) }
+            retargetTransition { QueueIndex.afterRemove(it, removed) }
+            updateNowPlayingInfo()
+            return
+        }
+        val replacement = QueueIndex.replacementForRemovedCurrent(
+            current = state.currentIndex,
+            removed = removed,
+            newSize = queue.size,
+            repeatAll = state.repeatMode == RepeatMode.ALL,
+            upNextFirst = upNext.indices.firstOrNull(),
+        )
+        if (replacement == null) {
+            stop()
+            _playbackState.update { it.copy(queue = queue, currentIndex = queue.lastIndex, currentTrack = queue.lastOrNull()) }
+            updateNowPlayingInfo()
+            return
+        }
+        val wasPlaying = state.status == PlaybackStatus.PLAYING || state.status == PlaybackStatus.BUFFERING
+        upNext.onCurrent(replacement)
+        _positionMs.value = 0L
+        _playbackState.update { it.copy(queue = queue, currentIndex = replacement, currentTrack = queue[replacement], positionMs = 0L) }
+        loadTrack(replacement, autoplay = wasPlaying)
+    }
+
+    actual fun moveQueueItem(from: Int, to: Int) {
+        val state = _playbackState.value
+        if (from !in state.queue.indices || to !in state.queue.indices || from == to) return
+        upNext.onMove(from, to)
+        _playbackState.update {
+            it.copy(queue = it.queue.moved(from, to), currentIndex = QueueIndex.afterMove(it.currentIndex, from, to))
+        }
+        retargetTransition { QueueIndex.afterMove(it, from, to) }
+        updateNowPlayingInfo()
+    }
+
+    // An end-of-track transition decided before a queue edit may now target the wrong track. A
+    // planned fade is simply re-decided; a gapless next is already scheduled behind the current
+    // segment on the node, so the current track is re-scheduled from its position (like a seek).
+    private fun retargetTransition(remap: (Int) -> Int?) {
+        val target = gaplessNext?.index ?: plannedFade?.index ?: return
+        val state = _playbackState.value
+        val moved = remap(target)
+        val wanted = when {
+            state.repeatMode == RepeatMode.ONE -> state.currentIndex
+            else -> upNext.peek(state.currentIndex) ?: if (state.shuffleEnabled) moved else nextIndex(state, direction = 1)
+        }
+        if (moved != null && moved == wanted) {
+            gaplessNext = gaplessNext?.let { GaplessNext(moved, it.file) }
+            plannedFade = plannedFade?.let { PlannedFade(moved, it.startAtMs) }
+            return
+        }
+        if (gaplessNext != null) {
+            loadTrack(state.currentIndex, autoplay = state.status == PlaybackStatus.PLAYING, resumeAtMs = _positionMs.value)
+        } else {
+            resetTransition()
+        }
     }
 
     actual fun play() {
@@ -630,6 +722,7 @@ actual class PlayerEngine {
             stop()
             return
         }
+        upNext.onCurrent(nextIndex)
         _positionMs.value = 0L
         _playbackState.update { it.copy(currentIndex = nextIndex, currentTrack = queue[nextIndex], positionMs = 0L) }
         loadTrack(nextIndex, autoplay = wasPlaying)
@@ -638,6 +731,8 @@ actual class PlayerEngine {
     private fun nextIndex(state: PlaybackState, direction: Int): Int? {
         val size = state.queue.size
         if (size == 0) return null
+
+        if (direction > 0) upNext.peek(state.currentIndex)?.takeIf { it in 0 until size }?.let { return it }
 
         if (state.shuffleEnabled && size > 1) {
             var candidate: Int
@@ -754,6 +849,7 @@ actual class PlayerEngine {
         setGainNow(playerGain, playerTags)
         segmentStartFrame = 0
         resetTransition()
+        upNext.onCurrent(next.index)
         _positionMs.value = 0L
         _playbackState.update {
             it.copy(
@@ -864,6 +960,7 @@ actual class PlayerEngine {
         segmentStartFrame = 0
         nodeOffsetSeconds = 0.0
         resetTransition()
+        upNext.onCurrent(fade.index)
         _positionMs.value = 0L
         _playbackState.update {
             it.copy(currentIndex = fade.index, currentTrack = track, positionMs = 0L, durationMs = file.durationMs())

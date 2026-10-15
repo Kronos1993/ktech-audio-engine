@@ -5,6 +5,7 @@ import com.kronos.ktech.audioengine.eq.EqualizerChain
 import com.kronos.ktech.audioengine.eq.StereoWidener
 import com.kronos.ktech.audioengine.domain.AudioOutputDevice
 import com.kronos.ktech.audioengine.domain.AudioOutputDeviceType
+import com.kronos.ktech.audioengine.domain.EnqueuePosition
 import com.kronos.ktech.audioengine.domain.EqualizerBands
 import com.kronos.ktech.audioengine.domain.OutputSelectionMode
 import com.kronos.ktech.audioengine.domain.PlaybackState
@@ -73,6 +74,11 @@ actual class PlayerEngine {
     actual val outputSelectionMode: OutputSelectionMode = OutputSelectionMode.IN_APP_LIST
 
     private var playbackJob: Job? = null
+
+    // Serializes queue edits with the playback thread's own track changes, so an index picked from
+    // the queue is never applied to a queue edited in between.
+    private val queueLock = Any()
+    private val upNext = UpNext()
     private var currentLine: SourceDataLine? = null
     private var volume: Float = 1f
 
@@ -150,16 +156,97 @@ actual class PlayerEngine {
 
     actual fun setQueue(tracks: List<Track>, startIndex: Int) {
         _positionMs.value = 0L
-        _playbackState.update {
-            it.copy(
-                queue = tracks,
-                currentIndex = startIndex,
-                currentTrack = tracks.getOrNull(startIndex),
-                positionMs = 0L,
-                status = PlaybackStatus.IDLE,
-            )
+        synchronized(queueLock) {
+            upNext.clear()
+            _playbackState.update {
+                it.copy(
+                    queue = tracks,
+                    currentIndex = startIndex,
+                    currentTrack = tracks.getOrNull(startIndex),
+                    positionMs = 0L,
+                    status = PlaybackStatus.IDLE,
+                )
+            }
         }
         startTrack(startIndex, autoplay = false)
+        syncNowPlaying()
+    }
+
+    actual fun enqueue(tracks: List<Track>, position: EnqueuePosition) {
+        if (tracks.isEmpty()) return
+        if (_playbackState.value.queue.isEmpty()) {
+            setQueue(tracks, 0)
+            return
+        }
+        synchronized(queueLock) {
+            val state = _playbackState.value
+            val at = when (position) {
+                EnqueuePosition.NEXT -> upNext.insertionIndex(state.currentIndex, state.queue.size)
+                EnqueuePosition.END -> state.queue.size
+            }
+            upNext.onInsert(at, tracks.size, asNext = position == EnqueuePosition.NEXT)
+            _playbackState.update {
+                it.copy(
+                    queue = it.queue.subList(0, at) + tracks + it.queue.subList(at, it.queue.size),
+                    currentIndex = QueueIndex.afterInsert(it.currentIndex, at, tracks.size),
+                )
+            }
+        }
+        syncNowPlaying()
+    }
+
+    actual fun removeFromQueue(indices: Set<Int>) {
+        var restartAt: Int? = null
+        var wasPlaying = false
+        var ended = false
+        synchronized(queueLock) {
+            val state = _playbackState.value
+            val removed = indices.filterTo(mutableSetOf()) { it in state.queue.indices }
+            if (removed.isEmpty()) return
+            val queue = state.queue.filterIndexed { index, _ -> index !in removed }
+            upNext.onRemove(removed)
+            val current = QueueIndex.afterRemove(state.currentIndex, removed)
+            if (current != null) {
+                _playbackState.update { it.copy(queue = queue, currentIndex = current) }
+                return@synchronized
+            }
+            val replacement = QueueIndex.replacementForRemovedCurrent(
+                current = state.currentIndex,
+                removed = removed,
+                newSize = queue.size,
+                repeatAll = state.repeatMode == RepeatMode.ALL,
+                upNextFirst = upNext.indices.firstOrNull(),
+            )
+            if (replacement == null) {
+                ended = true
+                _playbackState.update { it.copy(queue = queue, currentIndex = queue.lastIndex, currentTrack = queue.lastOrNull()) }
+                return@synchronized
+            }
+            upNext.onCurrent(replacement)
+            wasPlaying = state.status == PlaybackStatus.PLAYING || state.status == PlaybackStatus.BUFFERING
+            restartAt = replacement
+            _positionMs.value = 0L
+            _playbackState.update {
+                it.copy(queue = queue, currentIndex = replacement, currentTrack = queue[replacement], positionMs = 0L)
+            }
+        }
+        if (ended) {
+            stop()
+            return
+        }
+        restartAt?.let { startTrack(it, autoplay = wasPlaying) }
+        syncNowPlaying()
+    }
+
+    actual fun moveQueueItem(from: Int, to: Int) {
+        synchronized(queueLock) {
+            val state = _playbackState.value
+            if (from !in state.queue.indices || to !in state.queue.indices || from == to) return
+            upNext.onMove(from, to)
+            _playbackState.update {
+                it.copy(queue = it.queue.moved(from, to), currentIndex = QueueIndex.afterMove(it.currentIndex, from, to))
+            }
+        }
         syncNowPlaying()
     }
 
@@ -302,18 +389,23 @@ actual class PlayerEngine {
     }
 
     private fun advance(direction: Int) {
-        val state = _playbackState.value
-        val queue = state.queue
-        if (queue.isEmpty()) return
+        var wasPlaying = false
+        val nextIndex = synchronized(queueLock) {
+            val state = _playbackState.value
+            val queue = state.queue
+            if (queue.isEmpty()) return
 
-        val wasPlaying = state.status == PlaybackStatus.PLAYING
-        val nextIndex = nextIndex(state, direction)
+            wasPlaying = state.status == PlaybackStatus.PLAYING
+            nextIndex(state, direction)?.also { next ->
+                upNext.onCurrent(next)
+                _positionMs.value = 0L
+                _playbackState.update { it.copy(currentIndex = next, currentTrack = queue[next], positionMs = 0L) }
+            }
+        }
         if (nextIndex == null) {
             stop()
             return
         }
-        _positionMs.value = 0L
-        _playbackState.update { it.copy(currentIndex = nextIndex, currentTrack = queue[nextIndex], positionMs = 0L) }
         startTrack(nextIndex, autoplay = wasPlaying)
         syncNowPlaying()
     }
@@ -321,6 +413,8 @@ actual class PlayerEngine {
     private fun nextIndex(state: PlaybackState, direction: Int): Int? {
         val size = state.queue.size
         if (size == 0) return null
+
+        if (direction > 0) upNext.peek(state.currentIndex)?.takeIf { it in 0 until size }?.let { return it }
 
         if (state.shuffleEnabled && size > 1) {
             var candidate: Int
@@ -483,14 +577,17 @@ actual class PlayerEngine {
                         // has no ONE case (it only special-cases ALL) — nextIndex() is shared
                         // with manual skip, where repeat-one must NOT stop skip-to-next/previous
                         // from actually changing tracks.
-                        val state = _playbackState.value
-                        val nextIndex = if (state.repeatMode == RepeatMode.ONE) outgoing.index else nextIndex(state, direction = 1)
-                        if (nextIndex == null) {
+                        val opened = synchronized(queueLock) {
+                            val state = _playbackState.value
+                            val nextIndex = if (state.repeatMode == RepeatMode.ONE) state.currentIndex else nextIndex(state, direction = 1)
+                            nextIndex?.let { openNextSource(it, sampleRate, channels) }
+                        }
+                        if (opened == null) {
                             source = null
                             stop()
                             return@launch
                         }
-                        source = openNextSource(nextIndex, sampleRate, channels)
+                        source = opened
                         continue
                     }
 
@@ -571,6 +668,7 @@ actual class PlayerEngine {
             throw t
         }
         source.configure(sampleRate, channels)
+        upNext.onCurrent(index)
         _positionMs.value = 0L
         _playbackState.update {
             it.copy(currentIndex = index, currentTrack = track, positionMs = 0L, durationMs = source.durationMs)
@@ -587,22 +685,23 @@ actual class PlayerEngine {
 
     // Opens the next track for a crossfade, or returns null when this transition must stay a
     // plain gapless cut (see Crossfade.windowMs).
-    private fun beginCrossfade(outgoing: PcmSource, sampleRate: Int, channels: Int): PcmSource? {
+    private fun beginCrossfade(outgoing: PcmSource, sampleRate: Int, channels: Int): PcmSource? = synchronized(queueLock) {
         val durationMs = outgoing.durationMs
         val remainingMs = durationMs - outgoing.positionMs
         val state = _playbackState.value
         if (state.repeatMode == RepeatMode.ONE) return null
         val nextIndex = nextIndex(state, direction = 1) ?: return null
+        // The outgoing source is still the current track here (no fade in progress yet).
         val windowMs = Crossfade.windowMs(
             requestedMs = crossfadeMs,
-            outgoing = state.queue.getOrNull(outgoing.index),
-            outgoingIndex = outgoing.index,
+            outgoing = state.currentTrack,
+            outgoingIndex = state.currentIndex,
             outgoingDurationMs = durationMs,
             incoming = state.queue.getOrNull(nextIndex),
             incomingIndex = nextIndex,
         )
         if (windowMs == 0L || remainingMs > windowMs) return null
-        return runCatching { openNextSource(nextIndex, sampleRate, channels) }.getOrNull()
+        runCatching { openNextSource(nextIndex, sampleRate, channels) }.getOrNull()
     }
 
     // Equal-power mix of one outgoing chunk with the same number of incoming samples.

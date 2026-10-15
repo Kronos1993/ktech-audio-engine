@@ -105,6 +105,7 @@ class MyApplication : Application() {
 
 ```kotlin
 import com.kronos.ktech.audioengine.PlayerEngine
+import com.kronos.ktech.audioengine.domain.EnqueuePosition
 import com.kronos.ktech.audioengine.domain.EqualizerBands
 import com.kronos.ktech.audioengine.domain.RepeatMode
 import com.kronos.ktech.audioengine.domain.Track
@@ -131,6 +132,19 @@ playerEngine.skipPrevious()
 playerEngine.setRepeatMode(RepeatMode.ALL) // OFF / ALL / ONE
 playerEngine.setShuffle(true)
 playerEngine.setVolume(0.8f) // 0f (silent) .. 1f (full)
+
+// Edit the queue in place, without interrupting the current track. playbackState.queue and
+// currentIndex update together, so queue[currentIndex] is always the playing row.
+// NEXT plays right after the current track, even with shuffle on; several NEXT calls play in the
+// order they were made. END appends (and joins the shuffle order). With nothing loaded, enqueue
+// behaves like setQueue(tracks, 0) - call play() to start.
+playerEngine.enqueue(listOf(track3), EnqueuePosition.NEXT)
+playerEngine.enqueue(listOf(track4, track5), EnqueuePosition.END)
+// Removing the current row moves on to the next one, keeping play/pause; with nothing after it,
+// playback ends as at the natural end of the queue.
+playerEngine.removeFromQueue(indices = setOf(2, 3))
+// Reorder: the playing track keeps playing, and currentIndex follows it.
+playerEngine.moveQueueItem(from = 4, to = 1)
 
 // Output device selection: check outputSelectionMode first. Not every platform can enumerate or
 // switch output devices programmatically - IN_APP_LIST means you render availableOutputDevices

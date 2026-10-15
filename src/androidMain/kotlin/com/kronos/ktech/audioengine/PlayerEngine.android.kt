@@ -20,9 +20,11 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.PlayerMessage
+import androidx.media3.exoplayer.source.ShuffleOrder.DefaultShuffleOrder
 import com.kronos.ktech.audioengine.eq.LuminaEqualizerAudioProcessor
 import com.kronos.ktech.audioengine.domain.AudioOutputDevice
 import com.kronos.ktech.audioengine.domain.AudioOutputDeviceType
+import com.kronos.ktech.audioengine.domain.EnqueuePosition
 import com.kronos.ktech.audioengine.domain.OutputSelectionMode
 import com.kronos.ktech.audioengine.domain.PlaybackState
 import com.kronos.ktech.audioengine.domain.PlaybackStatus
@@ -40,6 +42,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.random.Random
 
 private const val TAG = "PlayerEngine"
 private const val FADE_STEP_MS = 50L
@@ -120,6 +123,7 @@ actual class PlayerEngine(
         }
 
     private var queueTracks: List<Track> = emptyList()
+    private val upNext = UpNext()
 
     // Lyric line shown in place of the artist, tagged with the queue item it was applied to.
     private var lyricLineOverride: LyricLineOverride? = null
@@ -197,8 +201,9 @@ actual class PlayerEngine(
                     // known) means playbackState does NOT re-emit every 200ms anymore -
                     // only positionMs above does, and only on a genuine index/track/duration
                     // change does this trigger a real playbackState emission.
-                    val newIndex = exoPlayer.currentMediaItemIndex
+                    val newIndex = if (queueTracks.isEmpty()) C.INDEX_UNSET else exoPlayer.currentMediaItemIndex
                     val newTrack = queueTracks.getOrNull(newIndex)
+                    if (newIndex != _playbackState.value.currentIndex) upNext.onCurrent(newIndex)
                     val newDuration = exoPlayer.duration.takeIf { d -> d > 0 }
                     _playbackState.update { current ->
                         if (current.currentIndex == newIndex &&
@@ -304,26 +309,9 @@ actual class PlayerEngine(
     ) {
         cancelCrossfade()
         queueTracks = tracks
+        upNext.clear()
         lyricLineOverride = null
-        val mediaItems =
-            tracks.map { track ->
-                MediaItem
-                    .Builder()
-                    // Controllers replay what they saw by media id (Assistant suggestions,
-                    // "For you"), so it must name the track, not stay empty.
-                    .setMediaId(track.uri)
-                    .setUri(track.uri)
-                    .setMediaMetadata(
-                        MediaMetadata
-                            .Builder()
-                            .setTitle(track.title)
-                            .setArtist(track.artist)
-                            .setAlbumTitle(track.album)
-                            .apply { track.artworkUri?.let { setArtworkUri(Uri.parse(it)) } }
-                            .build(),
-                    ).build()
-            }
-        exoPlayer.setMediaItems(mediaItems, startIndex, 0L)
+        exoPlayer.setMediaItems(tracks.map { it.toMediaItem() }, startIndex, 0L)
         exoPlayer.prepare()
         _playbackState.update {
             it.copy(
@@ -331,6 +319,114 @@ actual class PlayerEngine(
                 currentIndex = startIndex,
                 currentTrack = tracks.getOrNull(startIndex),
             )
+        }
+    }
+
+    private fun Track.toMediaItem(): MediaItem = MediaItem
+        .Builder()
+        // Controllers replay what they saw by media id (Assistant suggestions,
+        // "For you"), so it must name the track, not stay empty.
+        .setMediaId(uri)
+        .setUri(uri)
+        .setMediaMetadata(
+            MediaMetadata
+                .Builder()
+                .setTitle(title)
+                .setArtist(artist)
+                .setAlbumTitle(album)
+                .apply { artworkUri?.let { setArtworkUri(Uri.parse(it)) } }
+                .build(),
+        ).build()
+
+    actual fun enqueue(tracks: List<Track>, position: EnqueuePosition) {
+        if (tracks.isEmpty()) return
+        if (queueTracks.isEmpty()) {
+            setQueue(tracks, 0)
+            return
+        }
+        val at = when (position) {
+            EnqueuePosition.NEXT -> upNext.insertionIndex(exoPlayer.currentMediaItemIndex, queueTracks.size)
+            EnqueuePosition.END -> queueTracks.size
+        }
+        queueTracks = queueTracks.subList(0, at) + tracks + queueTracks.subList(at, queueTracks.size)
+        upNext.onInsert(at, tracks.size, asNext = position == EnqueuePosition.NEXT)
+        remapQueueIndices { QueueIndex.afterInsert(it, at, tracks.size) }
+        exoPlayer.addMediaItems(at, tracks.map { it.toMediaItem() })
+        applyUpNextShuffleOrder()
+        publishQueue()
+    }
+
+    actual fun removeFromQueue(indices: Set<Int>) {
+        val removed = indices.filter { it in queueTracks.indices }.toSortedSet()
+        if (removed.isEmpty()) return
+        // ExoPlayer itself moves on from a removed current item (next in play order, keeping
+        // playWhenReady) or ends when nothing follows it.
+        val removesCurrent = exoPlayer.currentMediaItemIndex in removed
+        if (removesCurrent || plannedFadeIndex in removed) cancelCrossfade()
+        queueTracks = queueTracks.filterIndexed { index, _ -> index !in removed }
+        upNext.onRemove(removed)
+        remapQueueIndices { QueueIndex.afterRemove(it, removed) }
+        // Highest run first, so the lower indices stay valid; one call per contiguous run.
+        var end = removed.last()
+        var start = end
+        for (index in removed.reversed().drop(1)) {
+            if (index == start - 1) {
+                start = index
+            } else {
+                exoPlayer.removeMediaItems(start, end + 1)
+                end = index
+                start = index
+            }
+        }
+        exoPlayer.removeMediaItems(start, end + 1)
+        if (removesCurrent && queueTracks.isNotEmpty()) upNext.onCurrent(exoPlayer.currentMediaItemIndex)
+        publishQueue()
+    }
+
+    actual fun moveQueueItem(from: Int, to: Int) {
+        if (from !in queueTracks.indices || to !in queueTracks.indices || from == to) return
+        queueTracks = queueTracks.moved(from, to)
+        upNext.onMove(from, to)
+        remapQueueIndices { QueueIndex.afterMove(it, from, to) }
+        exoPlayer.moveMediaItem(from, to)
+        applyUpNextShuffleOrder()
+        publishQueue()
+    }
+
+    // Keeps the index-tagged crossfade plan and lyric override on their items; null drops them.
+    private fun remapQueueIndices(remap: (Int) -> Int?) {
+        if (plannedFadeIndex != C.INDEX_UNSET) {
+            val index = remap(plannedFadeIndex)
+            if (index == null) cancelCrossfade() else plannedFadeIndex = index
+        }
+        lyricLineOverride = lyricLineOverride?.let { override -> remap(override.index)?.let { override.copy(index = it) } }
+    }
+
+    // Shuffle would place play-next rows at random: move them right after the current item in the
+    // shuffle order, in the order they were queued.
+    @OptIn(UnstableApi::class)
+    private fun applyUpNextShuffleOrder() {
+        if (!exoPlayer.shuffleModeEnabled) return
+        val timeline = exoPlayer.currentTimeline
+        if (timeline.isEmpty) return
+        val current = exoPlayer.currentMediaItemIndex
+        val pending = upNext.indices.filter { it != current && it < timeline.windowCount }
+        if (pending.isEmpty()) return
+        val order = ArrayList<Int>(timeline.windowCount)
+        var index = timeline.getFirstWindowIndex(true)
+        while (index != C.INDEX_UNSET) {
+            order.add(index)
+            index = timeline.getNextWindowIndex(index, Player.REPEAT_MODE_OFF, true)
+        }
+        order.removeAll(pending.toSet())
+        order.addAll(order.indexOf(current) + 1, pending)
+        exoPlayer.setShuffleOrder(DefaultShuffleOrder(order.toIntArray(), Random.nextLong()))
+    }
+
+    private fun publishQueue() {
+        val index = if (queueTracks.isEmpty()) C.INDEX_UNSET else exoPlayer.currentMediaItemIndex
+        _playbackState.update {
+            it.copy(queue = queueTracks, currentIndex = index, currentTrack = queueTracks.getOrNull(index))
         }
     }
 
@@ -427,6 +523,7 @@ actual class PlayerEngine(
 
     actual fun setShuffle(enabled: Boolean) {
         exoPlayer.shuffleModeEnabled = enabled
+        applyUpNextShuffleOrder()
         _playbackState.update { it.copy(shuffleEnabled = enabled) }
     }
 
@@ -544,7 +641,7 @@ actual class PlayerEngine(
         helper.prepare()
         plannedFadeIndex = index
         plannedFadeMessage = exoPlayer
-            .createMessage { _, _ -> startCrossfade(index, windowMs) }
+            .createMessage { _, _ -> startCrossfade(windowMs) }
             .setLooper(Looper.getMainLooper())
             .setPosition(index, fadePointMs)
             .setDeleteAfterDelivery(true)
@@ -562,7 +659,9 @@ actual class PlayerEngine(
             it.playbackParameters = PlaybackParameters(playbackSpeed)
         }
 
-    private fun startCrossfade(index: Int, windowMs: Long) {
+    // Reads the plan's index rather than capturing it: a queue edit may have shifted the item.
+    private fun startCrossfade(windowMs: Long) {
+        val index = plannedFadeIndex
         val helper = fadeOutPlayer
         val nextIndex = exoPlayer.nextMediaItemIndex
         if (helper == null || index != plannedFadeIndex || index != exoPlayer.currentMediaItemIndex ||

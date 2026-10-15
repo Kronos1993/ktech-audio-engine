@@ -1,6 +1,7 @@
 package com.kronos.ktech.audioengine
 
 import com.kronos.ktech.audioengine.domain.AudioOutputDevice
+import com.kronos.ktech.audioengine.domain.EnqueuePosition
 import com.kronos.ktech.audioengine.domain.OutputSelectionMode
 import com.kronos.ktech.audioengine.domain.PlaybackState
 import com.kronos.ktech.audioengine.domain.RepeatMode
@@ -43,6 +44,22 @@ expect class PlayerEngine {
 
     /** Replaces the playback queue and starts playback at [startIndex]. */
     fun setQueue(tracks: List<Track>, startIndex: Int)
+
+    /**
+     * Inserts [tracks] into the queue without interrupting the current track (see [EnqueuePosition]).
+     * With nothing loaded it behaves like `setQueue(tracks, 0)`; call [play] to start.
+     */
+    fun enqueue(tracks: List<Track>, position: EnqueuePosition)
+
+    /**
+     * Removes the queue rows at [indices] (out-of-range ones are ignored) without interrupting the
+     * current track. Removing the current row moves on to the next one, keeping play/pause; with
+     * nothing after it, playback ends as at the natural end of the queue.
+     */
+    fun removeFromQueue(indices: Set<Int>)
+
+    /** Moves the queue row at [from] to [to] without interrupting the current track. */
+    fun moveQueueItem(from: Int, to: Int)
 
     /** Resumes/starts playback of the current track. */
     fun play()
