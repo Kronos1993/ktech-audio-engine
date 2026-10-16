@@ -58,21 +58,21 @@ internal object PlayerEngineJniBridge {
         System.load(resolveNativeLibPath())
     }.isSuccess
 
-    // Dev-mode only (`./gradlew :desktopApp:run` runs straight from Gradle's build
-    // output, no jpackage/installer step involved) — resolves the sibling module's
-    // Kotlin/Native build output directly from the working directory. Bundling
-    // either native library into a distributable, packaged app image is a separate
-    // follow-up (see each spec's §7 risk) — not needed for either spec's own
-    // verification.
+    // Lookup order: an explicit `ktech.audioengine.nativeLibDir`, then a packaged Compose
+    // Desktop app's resources dir (`compose.application.resources.dir`), then the bridge
+    // modules' build output relative to the working directory (dev runs).
     private fun resolveNativeLibPath(): String {
-        val relativeToRepoRoot = when {
-            isMac -> "macosNowPlayingBridge/build/bin/macosArm64/releaseShared/libmacosNowPlayingBridge.dylib"
-            isWindows -> "windowsNowPlayingBridge/build/bin/mingwX64/releaseShared/windowsNowPlayingBridge.dll"
+        val (fileName, devPath) = when {
+            isMac -> "libmacosNowPlayingBridge.dylib" to "macosNowPlayingBridge/build/bin/macosArm64/releaseShared"
+            isWindows -> "windowsNowPlayingBridge.dll" to "windowsNowPlayingBridge/build/bin/mingwX64/releaseShared"
             else -> error("resolveNativeLibPath() called on an unsupported OS")
         }
-        val candidates = listOf(File(relativeToRepoRoot), File("..", relativeToRepoRoot))
+        val packagedDirs = listOf("ktech.audioengine.nativeLibDir", "compose.application.resources.dir")
+            .mapNotNull { System.getProperty(it) }
+        val candidates = packagedDirs.map { File(it, fileName) } +
+            listOf(File(devPath, fileName), File(File("..", devPath), fileName))
         return candidates.map { it.absoluteFile }.firstOrNull { it.exists() }?.path
-            ?: error("$relativeToRepoRoot not found — build the matching native bridge module first")
+            ?: error("$fileName not found — build the matching native bridge module first")
     }
 }
 
