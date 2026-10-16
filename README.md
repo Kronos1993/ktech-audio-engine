@@ -233,26 +233,19 @@ For Android Auto, also export the service with both browse actions and declare t
     android:resource="@xml/automotive_app_desc" />
 ```
 
-## Known limitation: native now-playing integration is not portable out of the box
+## Desktop native now-playing integration
 
 On Desktop, macOS Control Center and Windows SMTC integration is implemented via two standalone
-native bridge modules (`macosNowPlayingBridge`, `windowsNowPlayingBridge`), built separately and
-loaded at runtime via `System.load()` on a path resolved relative to **the JVM process's current
-working directory at launch** — e.g. `macosNowPlayingBridge/build/bin/macosArm64/releaseShared/
-libmacosNowPlayingBridge.dylib`. This is a plain `java.io.File` relative-path lookup: it has nothing
-to do with where `ktech-audio-engine` itself is obtained from (a local module, a git submodule, or
-this published Maven artifact) — it only cares whether *your app's own launch directory* has those
-two bridges' compiled binaries sitting at that exact relative path underneath it.
+native bridge modules (`macosNowPlayingBridge`, `windowsNowPlayingBridge`). This library doesn't
+publish them: build them yourself and ship the binary with your app. At runtime the engine
+`System.load()`s the first of these that exists:
 
-In practice, that means a consumer only gets working native now-playing on Desktop if they build
-`macosNowPlayingBridge`/`windowsNowPlayingBridge` themselves (their source isn't published or
-distributed anywhere by this library) and launch their app from a working directory where the
-compiled binaries land at the expected relative path — this library ships no such source or binaries
-itself. The relevant `PlayerEngine` calls fail soft in that case (no crash; native integration simply
-reports unavailable) rather than throwing.
+1. `<ktech.audioengine.nativeLibDir>/<lib>` — explicit system property
+2. `<compose.application.resources.dir>/<lib>` — a Compose Desktop app's resources dir; put the
+   binary under `appResourcesRootDir`'s `macos-arm64/` or `windows-x64/` folder and it's found in
+   packaged builds and in `run` alike
+3. `macosNowPlayingBridge/build/bin/macosArm64/releaseShared/<lib>` (or the `windows…/mingwX64`
+   equivalent), relative to the working directory or its parent — dev runs from a checkout
 
-Fixing this for real external consumers (bundling the native binaries as classpath resources
-instead of a working-directory-relative path) is tracked as a separate, not-yet-started follow-on.
-Android and iOS now-playing integration are unaffected by this limitation — both use standard
-platform APIs (Media3 `MediaSessionService`, `AVAudioEngine`) with no native-bridge dependency at
-all.
+`<lib>` is `libmacosNowPlayingBridge.dylib` or `windowsNowPlayingBridge.dll`. If none exists, the
+native integration reports unavailable (no crash). Android and iOS don't use a native bridge.
