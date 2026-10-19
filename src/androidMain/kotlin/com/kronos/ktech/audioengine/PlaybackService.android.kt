@@ -64,11 +64,11 @@ class PlaybackService : MediaLibraryService() {
     // listener here would leak every prior PlaybackService instance across restarts.
     private val playbackListener = object : Player.Listener {
         override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
-            mediaSession?.setMediaButtonPreferences(buildMediaButtonPreferences())
+            refreshMediaButtons()
         }
 
         override fun onRepeatModeChanged(repeatMode: Int) {
-            mediaSession?.setMediaButtonPreferences(buildMediaButtonPreferences())
+            refreshMediaButtons()
         }
     }
 
@@ -94,6 +94,7 @@ class PlaybackService : MediaLibraryService() {
             .apply { buildSessionActivityPendingIntent()?.let { setSessionActivity(it) } }
             .build()
         mediaSession = session
+        browseProvider?.bindMediaButtonsRefresher { refreshMediaButtons() }
         // Registers the session with this service's own notification manager — without
         // this call, Media3 never learns a session exists to build a real notification
         // for (its automatic media-style notification with title/artist/artwork and
@@ -186,6 +187,21 @@ class PlaybackService : MediaLibraryService() {
         return listOf(shuffleButton, repeatButton)
     }
 
+    private fun hostMediaButtons(session: MediaSession, controller: MediaSession.ControllerInfo): List<CommandButton> =
+        browseProvider?.mediaButtonsFor(session, controller).orEmpty()
+
+    // The session-wide list first, then per-controller lists for controllers with host buttons: a
+    // session-wide set replaces every controller's list, so host buttons are re-applied after it.
+    private fun refreshMediaButtons() {
+        val session = mediaSession ?: return
+        val base = buildMediaButtonPreferences()
+        session.setMediaButtonPreferences(base)
+        session.connectedControllers.forEach { controller ->
+            val host = hostMediaButtons(session, controller)
+            if (host.isNotEmpty()) session.setMediaButtonPreferences(controller, base + host)
+        }
+    }
+
     private fun nextRepeatMode(): RepeatMode = when (playerEngine.exoPlayer.repeatMode) {
         Player.REPEAT_MODE_OFF -> RepeatMode.ALL
         Player.REPEAT_MODE_ALL -> RepeatMode.ONE
@@ -197,12 +213,16 @@ class PlaybackService : MediaLibraryService() {
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
         ): MediaSession.ConnectionResult {
+            val host = hostMediaButtons(session, controller)
             val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
                 .add(SessionCommand(ACTION_TOGGLE_SHUFFLE, Bundle.EMPTY))
                 .add(SessionCommand(ACTION_CYCLE_REPEAT, Bundle.EMPTY))
+                .apply { browseProvider?.customSessionCommands()?.forEach { add(it) } }
+                .apply { host.forEach { button -> button.sessionCommand?.let { add(it) } } }
                 .build()
             return MediaSession.ConnectionResult.AcceptedResultBuilder(session, controller)
                 .setAvailableSessionCommands(sessionCommands)
+                .apply { if (host.isNotEmpty()) setMediaButtonPreferences(buildMediaButtonPreferences() + host) }
                 .build()
         }
 
@@ -223,6 +243,7 @@ class PlaybackService : MediaLibraryService() {
             when (customCommand.customAction) {
                 ACTION_TOGGLE_SHUFFLE -> playerEngine.setShuffle(!playerEngine.exoPlayer.shuffleModeEnabled)
                 ACTION_CYCLE_REPEAT -> playerEngine.setRepeatMode(nextRepeatMode())
+                else -> browseProvider?.let { return it.onCustomCommand(session, controller, customCommand, args) }
             }
             return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
         }

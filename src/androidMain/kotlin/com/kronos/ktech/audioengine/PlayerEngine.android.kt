@@ -43,6 +43,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.random.Random
+import org.koin.mp.KoinPlatform
 
 private const val TAG = "PlayerEngine"
 private const val FADE_STEP_MS = 50L
@@ -78,6 +79,9 @@ actual class PlayerEngine(
     private val appContext: Context,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    // Optional host binding, looked up on first use (the host's Koin modules may load after the engine's).
+    private val artworkUriMapper: ArtworkUriMapper? by lazy { KoinPlatform.getKoinOrNull()?.getOrNull<ArtworkUriMapper>() }
     private val equalizerAudioProcessor = LuminaEqualizerAudioProcessor()
     private val replayGainAudioProcessor = ReplayGainAudioProcessor()
     internal val exoPlayer: ExoPlayer = ExoPlayer
@@ -334,7 +338,7 @@ actual class PlayerEngine(
                 .setTitle(title)
                 .setArtist(artist)
                 .setAlbumTitle(album)
-                .apply { artworkUri?.let { setArtworkUri(Uri.parse(it)) } }
+                .apply { artworkUri?.let { setArtworkUri(Uri.parse(artworkUriMapper?.map(it) ?: it)) } }
                 .build(),
         ).build()
 
