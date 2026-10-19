@@ -220,7 +220,10 @@ class PlaybackService : MediaLibraryService() {
                 .apply { browseProvider?.customSessionCommands()?.forEach { add(it) } }
                 .apply { host.forEach { button -> button.sessionCommand?.let { add(it) } } }
                 .build()
+            // Untrusted controllers (e.g. a Galaxy Watch's phone plugin) default to read-only player
+            // commands, which silently rejects their play/pause. The host's play gate still applies.
             return MediaSession.ConnectionResult.AcceptedResultBuilder(session, controller)
+                .setAvailablePlayerCommands(MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS)
                 .setAvailableSessionCommands(sessionCommands)
                 .apply { if (host.isNotEmpty()) setMediaButtonPreferences(buildMediaButtonPreferences() + host) }
                 .build()
