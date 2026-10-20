@@ -183,6 +183,12 @@ if (playerEngine.supportsSkipSilence) playerEngine.setSkipSilenceEnabled(true)
 // at fallbackDb. A peak tag caps the gain so the track never clips. Independent of setVolume.
 playerEngine.setReplayGain(ReplayGainMode.ALBUM, preampDb = 0f, fallbackDb = -6f)
 
+// Opt a track in to its file's own tags: once the stream loads, a non-blank embedded title,
+// artist, album and cover replace the ones you passed (useful for http(s) files named only by
+// their URL). Covers are cached as STREAM_ARTWORK_DIR/embeddedArtworkFileName(uri) in each
+// platform's cache folder. Track.withEmbeddedMetadata(...) applies the same rule in your own code.
+playerEngine.setQueue(tracks = listOf(Track(uri = url, title = "song", artist = null, useEmbeddedMetadata = true)), startIndex = 0)
+
 // Shows a line (e.g. the current lyric) in place of the artist on the system now-playing
 // surfaces (Android notification/lock screen, iOS lock screen, macOS/Windows media controls).
 // null restores the artist; the override is dropped automatically when the track changes.

@@ -7,7 +7,10 @@ import com.kronos.ktech.audioengine.domain.OutputSelectionMode
 import com.kronos.ktech.audioengine.domain.PlaybackState
 import com.kronos.ktech.audioengine.domain.PlaybackStatus
 import com.kronos.ktech.audioengine.domain.RepeatMode
+import com.kronos.ktech.audioengine.domain.STREAM_ARTWORK_DIR
 import com.kronos.ktech.audioengine.domain.Track
+import com.kronos.ktech.audioengine.domain.embeddedArtworkFileName
+import com.kronos.ktech.audioengine.domain.withEmbeddedMetadata
 import com.kronos.ktech.audioengine.eq.EqualizerChain
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.get
@@ -45,6 +48,10 @@ import platform.AVFAudio.AVAudioUnitEQFilterTypeParametric
 import platform.AVFAudio.AVAudioUnitTimePitch
 import platform.AVFAudio.setActive
 import platform.AVFoundation.AVAudioTimePitchAlgorithmSpectral
+import platform.AVFoundation.AVMetadataCommonKeyAlbumName
+import platform.AVFoundation.AVMetadataCommonKeyArtist
+import platform.AVFoundation.AVMetadataCommonKeyArtwork
+import platform.AVFoundation.AVMetadataCommonKeyTitle
 import platform.AVFoundation.AVMetadataExtraAttributeInfoKey
 import platform.AVFoundation.AVMetadataItem
 import platform.AVFoundation.AVPlayer
@@ -54,7 +61,11 @@ import platform.AVFoundation.AVPlayerItemStatusFailed
 import platform.AVFoundation.AVPlayerItemStatusReadyToPlay
 import platform.AVFoundation.AVPlayerTimeControlStatusPlaying
 import platform.AVFoundation.AVURLAsset
+import platform.AVFoundation.asset
+import platform.AVFoundation.commonKey
+import platform.AVFoundation.commonMetadata
 import platform.AVFoundation.currentTime
+import platform.AVFoundation.dataValue
 import platform.AVFoundation.duration
 import platform.AVFoundation.key
 import platform.AVFoundation.metadata
@@ -69,10 +80,15 @@ import platform.AVFoundation.stringValue
 import platform.AVFoundation.timeControlStatus
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMakeWithSeconds
+import platform.Foundation.NSCachesDirectory
+import platform.Foundation.NSData
+import platform.Foundation.NSFileManager
 import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSNumber
 import platform.Foundation.NSOperationQueue
 import platform.Foundation.NSURL
+import platform.Foundation.NSUserDomainMask
+import platform.Foundation.writeToURL
 import platform.MediaPlayer.MPMediaItemArtwork
 import platform.MediaPlayer.MPMediaItemPropertyAlbumTitle
 import platform.MediaPlayer.MPMediaItemPropertyArtist
@@ -201,6 +217,7 @@ actual class PlayerEngine {
     // timeControlStatus so a stalled/buffering stream reads BUFFERING rather than PLAYING.
     private var streamWantsPlayback = false
     private var streamDurationKnown = false
+    private var streamMetadataRead = false
 
     private val commandCenter = MPRemoteCommandCenter.sharedCommandCenter()
 
@@ -1067,6 +1084,11 @@ actual class PlayerEngine {
                     _playbackState.update { it.copy(durationMs = (seconds * 1000).toLong()) }
                 }
             }
+            // The asset's metadata is loaded by the time the item is ready to play.
+            if (!streamMetadataRead && item.status == AVPlayerItemStatusReadyToPlay) {
+                streamMetadataRead = true
+                applyEmbeddedMetadata(item)
+            }
         }
         val seconds = CMTimeGetSeconds(player.currentTime())
         if (!seconds.isNaN() && !seconds.isInfinite()) {
@@ -1084,6 +1106,45 @@ actual class PlayerEngine {
         }
     }
 
+    private fun applyEmbeddedMetadata(item: AVPlayerItem) {
+        val state = _playbackState.value
+        val index = state.currentIndex
+        val track = state.queue.getOrNull(index) ?: return
+        if (!track.useEmbeddedMetadata) return
+        val items = item.asset.commonMetadata.filterIsInstance<AVMetadataItem>()
+
+        fun valueFor(key: String?) = items.firstOrNull { it.commonKey == key }?.stringValue
+        val artwork = items.firstOrNull { it.commonKey == AVMetadataCommonKeyArtwork }?.dataValue
+        val enriched = track.withEmbeddedMetadata(
+            title = valueFor(AVMetadataCommonKeyTitle),
+            artist = valueFor(AVMetadataCommonKeyArtist),
+            album = valueFor(AVMetadataCommonKeyAlbumName),
+            artworkUri = artwork?.let { writeEmbeddedArtwork(track.uri, it) },
+        )
+        if (enriched == track) return
+        _playbackState.update { current ->
+            if (current.queue.getOrNull(index)?.uri != track.uri) return@update current
+            current.copy(
+                queue = current.queue.toMutableList().also { it[index] = enriched },
+                currentTrack = if (current.currentIndex == index) enriched else current.currentTrack,
+            )
+        }
+        updateNowPlayingInfo()
+    }
+
+    private fun writeEmbeddedArtwork(uri: String, data: NSData): String? {
+        val manager = NSFileManager.defaultManager
+        val caches = manager.URLsForDirectory(NSCachesDirectory, NSUserDomainMask).firstOrNull() as? NSURL ?: return null
+        val folder = caches.URLByAppendingPathComponent(STREAM_ARTWORK_DIR) ?: return null
+        val file = folder.URLByAppendingPathComponent(embeddedArtworkFileName(uri)) ?: return null
+        val path = file.path ?: return null
+        if (!manager.fileExistsAtPath(path)) {
+            manager.createDirectoryAtURL(folder, withIntermediateDirectories = true, attributes = null, error = null)
+            if (!data.writeToURL(file, atomically = true)) return null
+        }
+        return file.absoluteString
+    }
+
     private fun releaseStream() {
         streamEndObserver?.let { NSNotificationCenter.defaultCenter.removeObserver(it) }
         streamEndObserver = null
@@ -1093,6 +1154,7 @@ actual class PlayerEngine {
         streamItem = null
         streamWantsPlayback = false
         streamDurationKnown = false
+        streamMetadataRead = false
     }
 
     private fun Track.isRemoteStream(): Boolean = Crossfade.isRemoteStream(uri)

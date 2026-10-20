@@ -11,7 +11,10 @@ import com.kronos.ktech.audioengine.domain.OutputSelectionMode
 import com.kronos.ktech.audioengine.domain.PlaybackState
 import com.kronos.ktech.audioengine.domain.PlaybackStatus
 import com.kronos.ktech.audioengine.domain.RepeatMode
+import com.kronos.ktech.audioengine.domain.STREAM_ARTWORK_DIR
 import com.kronos.ktech.audioengine.domain.Track
+import com.kronos.ktech.audioengine.domain.embeddedArtworkFileName
+import com.kronos.ktech.audioengine.domain.withEmbeddedMetadata
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,6 +28,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.bytedeco.ffmpeg.global.avformat.AV_DISPOSITION_ATTACHED_PIC
 import org.bytedeco.javacv.FFmpegFrameGrabber
 import java.io.File
 import java.net.URI
@@ -504,6 +508,7 @@ actual class PlayerEngine {
                         status = if (!isPaused) PlaybackStatus.PLAYING else PlaybackStatus.PAUSED,
                     )
                 }
+                applyEmbeddedMetadata(index, track, grabber)
                 syncNowPlaying()
 
                 // The line stays open for every natural track change below (gapless); later
@@ -673,9 +678,53 @@ actual class PlayerEngine {
         _playbackState.update {
             it.copy(currentIndex = index, currentTrack = track, positionMs = 0L, durationMs = source.durationMs)
         }
+        applyEmbeddedMetadata(index, track, grabber)
         syncNowPlaying()
         return source
     }
+
+    // Call after grabber.start(). Ogg keeps its Vorbis comments on the audio stream, not the
+    // container, and tag key case varies by container.
+    private fun applyEmbeddedMetadata(index: Int, track: Track, grabber: FFmpegFrameGrabber) {
+        if (!track.useEmbeddedMetadata) return
+        val tags = (grabber.metadata.orEmpty() + grabber.audioMetadata.orEmpty()).mapKeys { it.key.lowercase() }
+        val enriched = track.withEmbeddedMetadata(
+            title = tags["title"],
+            artist = tags["artist"],
+            album = tags["album"],
+            artworkUri = readAttachedPicture(grabber)?.let { writeEmbeddedArtwork(track.uri, it) },
+        )
+        if (enriched == track) return
+        _playbackState.update { current ->
+            if (current.queue.getOrNull(index)?.uri != track.uri) return@update current
+            current.copy(
+                queue = current.queue.toMutableList().also { it[index] = enriched },
+                currentTrack = if (current.currentIndex == index) enriched else current.currentTrack,
+            )
+        }
+    }
+
+    // An embedded cover is a stream flagged as an attached picture, whose single packet is the image file.
+    private fun readAttachedPicture(grabber: FFmpegFrameGrabber): ByteArray? = runCatching {
+        val context = grabber.formatContext ?: return null
+        (0 until context.nb_streams()).firstNotNullOfOrNull { i ->
+            val stream = context.streams(i)
+            if ((stream.disposition() and AV_DISPOSITION_ATTACHED_PIC) == 0) return@firstNotNullOfOrNull null
+            val packet = stream.attached_pic()
+            val data = packet.data()
+            if (packet.size() <= 0 || data == null || data.isNull) null else ByteArray(packet.size()).also { data.get(it) }
+        }
+    }.getOrNull()
+
+    private fun writeEmbeddedArtwork(uri: String, bytes: ByteArray): String? = runCatching {
+        val folder = File(File(System.getProperty("java.io.tmpdir"), "ktech-audio-engine"), STREAM_ARTWORK_DIR)
+        val file = File(folder, embeddedArtworkFileName(uri))
+        if (!file.exists()) {
+            folder.mkdirs()
+            file.writeBytes(bytes)
+        }
+        file.toURI().toString()
+    }.getOrNull()
 
     private fun isInCrossfadeWindow(outgoing: PcmSource): Boolean {
         val durationMs = outgoing.durationMs

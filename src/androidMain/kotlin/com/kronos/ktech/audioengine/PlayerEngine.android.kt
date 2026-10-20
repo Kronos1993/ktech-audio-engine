@@ -17,6 +17,7 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.PlayerMessage
@@ -29,7 +30,11 @@ import com.kronos.ktech.audioengine.domain.OutputSelectionMode
 import com.kronos.ktech.audioengine.domain.PlaybackState
 import com.kronos.ktech.audioengine.domain.PlaybackStatus
 import com.kronos.ktech.audioengine.domain.RepeatMode
+import com.kronos.ktech.audioengine.domain.STREAM_ARTWORK_DIR
 import com.kronos.ktech.audioengine.domain.Track
+import com.kronos.ktech.audioengine.domain.embeddedArtworkFileName
+import com.kronos.ktech.audioengine.domain.withEmbeddedMetadata
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -170,6 +175,8 @@ actual class PlayerEngine(
                 }
 
                 override fun onIsPlayingChanged(isPlaying: Boolean) = updateStatus()
+
+                override fun onTracksChanged(tracks: Tracks) = applyEmbeddedMetadata(tracks)
 
                 // MediaSession/notification commands reach exoPlayer directly, not through this
                 // class - keep the fade-out helper in step with them here.
@@ -338,7 +345,12 @@ actual class PlayerEngine(
                 .setTitle(title)
                 .setArtist(artist)
                 .setAlbumTitle(album)
-                .apply { artworkUri?.let { setArtworkUri(Uri.parse(artworkUriMapper?.map(it) ?: it)) } }
+                // An embedded cover lives in this app's private cache, which other processes can't
+                // open; the session gets it as the stream's artworkData instead.
+                .apply {
+                    artworkUri?.takeUnless { useEmbeddedMetadata && it.contains("/$STREAM_ARTWORK_DIR/") }
+                        ?.let { setArtworkUri(Uri.parse(artworkUriMapper?.map(it) ?: it)) }
+                }
                 .build(),
         ).build()
 
@@ -742,6 +754,46 @@ actual class PlayerEngine(
         val metadata = item.mediaMetadata.buildUpon().setArtist(artist).build()
         exoPlayer.replaceMediaItem(index, item.buildUpon().setMediaMetadata(metadata).build())
     }
+
+    // MediaItem metadata outranks the stream's in exoPlayer.mediaMetadata, so the tags are read
+    // from the current item's track formats instead.
+    @OptIn(UnstableApi::class)
+    private fun applyEmbeddedMetadata(tracks: Tracks) {
+        val index = exoPlayer.currentMediaItemIndex
+        val track = queueTracks.getOrNull(index) ?: return
+        if (!track.useEmbeddedMetadata || exoPlayer.currentMediaItem?.mediaId != track.uri) return
+        val formatMetadata = tracks.groups
+            .filter { it.type == C.TRACK_TYPE_AUDIO }
+            .flatMap { group -> (0 until group.length).mapNotNull { group.getTrackFormat(it).metadata } }
+        if (formatMetadata.isEmpty()) return
+        val embedded = MediaMetadata.Builder().populateFromMetadata(formatMetadata).build()
+        val enriched = track.withEmbeddedMetadata(
+            title = embedded.title?.toString(),
+            artist = embedded.artist?.toString(),
+            album = embedded.albumTitle?.toString(),
+            artworkUri = embedded.artworkData?.let { writeEmbeddedArtwork(track.uri, it) },
+        )
+        if (enriched == track) return
+        queueTracks = queueTracks.toMutableList().also { it[index] = enriched }
+        publishQueue()
+        val item = exoPlayer.getMediaItemAt(index)
+        val metadata = item.mediaMetadata
+            .buildUpon()
+            .setTitle(enriched.title)
+            .setArtist(enriched.artist)
+            .setAlbumTitle(enriched.album)
+            .build()
+        exoPlayer.replaceMediaItem(index, item.buildUpon().setMediaMetadata(metadata).build())
+    }
+
+    private fun writeEmbeddedArtwork(uri: String, bytes: ByteArray): String? = runCatching {
+        val file = File(File(appContext.cacheDir, STREAM_ARTWORK_DIR), embeddedArtworkFileName(uri))
+        if (!file.exists()) {
+            file.parentFile?.mkdirs()
+            file.writeBytes(bytes)
+        }
+        Uri.fromFile(file).toString()
+    }.getOrNull()
 
     actual fun release() {
         audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
