@@ -1,13 +1,16 @@
 package com.kronos.ktech.audioengine
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.audiofx.Visualizer
 import android.net.Uri
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
@@ -53,6 +56,14 @@ import org.koin.mp.KoinPlatform
 private const val TAG = "PlayerEngine"
 private const val FADE_STEP_MS = 50L
 
+// A fade that starts late, after a seek close to the end, still gives the helper this long to load.
+private const val LATE_FADE_LOAD_MS = 500L
+private const val MIN_LATE_FADE_MS = 1_000L
+
+// Playing with no audible capture for this long means the Visualizer is dead or never got created.
+private const val VISUALIZER_STALL_MS = 3_000L
+private const val VISUALIZER_SILENCE_PEAK = 1
+
 // Deliberately excludes types with no meaningful selectable-music-output identity
 // (TYPE_BUILTIN_EARPIECE, TYPE_TELEPHONY, TYPE_FM, etc.) that GET_DEVICES_OUTPUTS can
 // still return on some devices. TYPE_BLUETOOTH_SCO is deliberately excluded too, even
@@ -94,6 +105,8 @@ actual class PlayerEngine(
         .setRenderersFactory(LuminaRenderersFactory(appContext, equalizerAudioProcessor, replayGainAudioProcessor))
         // Media focus: pauses/ducks for calls and other apps, and makes Android Auto route this audio to the car.
         .setAudioAttributes(MUSIC_AUDIO_ATTRIBUTES, true)
+        // Without it the CPU can sleep once a track's audio drains, so nothing starts the next one.
+        .setWakeMode(C.WAKE_MODE_LOCAL)
         .build()
 
     private val _playbackState = MutableStateFlow(PlaybackState())
@@ -158,6 +171,9 @@ actual class PlayerEngine(
     private var ignoreNextSeekDiscontinuity = false
     private var visualizer: Visualizer? = null
     private var visualizerSessionId: Int = 0
+
+    @Volatile
+    private var lastAudibleCaptureMs: Long = 0L
     private var tickerJob: Job? = null
     // Liveness comes from PlaybackService's own onCreate/onDestroy, not a flag kept here: the
     // service can die independently of this singleton (notification swipe, memory pressure).
@@ -177,6 +193,13 @@ actual class PlayerEngine(
                 override fun onIsPlayingChanged(isPlaying: Boolean) = updateStatus()
 
                 override fun onTracksChanged(tracks: Tracks) = applyEmbeddedMetadata(tracks)
+
+                // Here rather than in setShuffle: session controllers can toggle shuffle directly.
+                override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+                    if (!shuffleModeEnabled) return
+                    startShuffleOrderAtCurrent()
+                    applyUpNextShuffleOrder()
+                }
 
                 // MediaSession/notification commands reach exoPlayer directly, not through this
                 // class - keep the fade-out helper in step with them here.
@@ -275,10 +298,18 @@ actual class PlayerEngine(
     @OptIn(UnstableApi::class)
     private fun ensureVisualizer() {
         val sessionId = exoPlayer.audioSessionId
-        if (sessionId == 0 || sessionId == visualizerSessionId) return
+        if (sessionId == 0) return
+        val now = SystemClock.elapsedRealtime()
+        if (!exoPlayer.isPlaying || exoPlayer.volume == 0f) lastAudibleCaptureMs = now
+        if (sessionId == visualizerSessionId && now - lastAudibleCaptureMs < VISUALIZER_STALL_MS) return
+        // Also the retry interval: the permission may be granted after the first attempt.
+        lastAudibleCaptureMs = now
+        if (appContext.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
         visualizerSessionId = sessionId
+        _audioLevel.value = 0f
+        visualizer?.release()
+        visualizer = null
         runCatching {
-            visualizer?.release()
             visualizer =
                 Visualizer(sessionId).apply {
                     captureSize = Visualizer.getCaptureSizeRange()[0]
@@ -296,6 +327,7 @@ actual class PlayerEngine(
                                     val delta = kotlin.math.abs(unsigned - 128)
                                     if (delta > peak) peak = delta
                                 }
+                                if (peak > VISUALIZER_SILENCE_PEAK) lastAudibleCaptureMs = SystemClock.elapsedRealtime()
                                 _audioLevel.value = (peak / 128f).coerceIn(0f, 1f)
                             }
 
@@ -323,6 +355,8 @@ actual class PlayerEngine(
         upNext.clear()
         lyricLineOverride = null
         exoPlayer.setMediaItems(tracks.map { it.toMediaItem() }, startIndex, 0L)
+        startShuffleOrderAtCurrent()
+        updateWakeMode()
         exoPlayer.prepare()
         _playbackState.update {
             it.copy(
@@ -368,7 +402,9 @@ actual class PlayerEngine(
         upNext.onInsert(at, tracks.size, asNext = position == EnqueuePosition.NEXT)
         remapQueueIndices { QueueIndex.afterInsert(it, at, tracks.size) }
         exoPlayer.addMediaItems(at, tracks.map { it.toMediaItem() })
+        moveToRandomSlotsAfterCurrent(at until at + tracks.size)
         applyUpNextShuffleOrder()
+        updateWakeMode()
         publishQueue()
     }
 
@@ -428,16 +464,54 @@ actual class PlayerEngine(
         val current = exoPlayer.currentMediaItemIndex
         val pending = upNext.indices.filter { it != current && it < timeline.windowCount }
         if (pending.isEmpty()) return
+        val order = currentShuffleOrder()
+        order.removeAll(pending.toSet())
+        order.addAll(order.indexOf(current) + 1, pending)
+        exoPlayer.setShuffleOrder(DefaultShuffleOrder(order.toIntArray(), Random.nextLong()))
+    }
+
+    // ExoPlayer's shuffle order leaves the current item at a random place in it: with repeat off,
+    // the items before it never play, and an item in last place has no next and ends playback.
+    @OptIn(UnstableApi::class)
+    private fun startShuffleOrderAtCurrent() {
+        if (!exoPlayer.shuffleModeEnabled || exoPlayer.mediaItemCount == 0) return
+        val current = exoPlayer.currentMediaItemIndex
+        val rest = (0 until exoPlayer.mediaItemCount).filter { it != current }.shuffled()
+        exoPlayer.setShuffleOrder(DefaultShuffleOrder((listOf(current) + rest).toIntArray(), Random.nextLong()))
+    }
+
+    // ExoPlayer inserts added items anywhere in the shuffle order, also before the current item.
+    @OptIn(UnstableApi::class)
+    private fun moveToRandomSlotsAfterCurrent(indices: IntRange) {
+        if (!exoPlayer.shuffleModeEnabled) return
+        val order = currentShuffleOrder()
+        order.removeAll(indices.toSet())
+        val firstSlot = order.indexOf(exoPlayer.currentMediaItemIndex) + 1
+        indices.forEach { order.add(Random.nextInt(firstSlot, order.size + 1), it) }
+        exoPlayer.setShuffleOrder(DefaultShuffleOrder(order.toIntArray(), Random.nextLong()))
+    }
+
+    private fun currentShuffleOrder(): MutableList<Int> {
+        val timeline = exoPlayer.currentTimeline
         val order = ArrayList<Int>(timeline.windowCount)
         var index = timeline.getFirstWindowIndex(true)
         while (index != C.INDEX_UNSET) {
             order.add(index)
             index = timeline.getNextWindowIndex(index, Player.REPEAT_MODE_OFF, true)
         }
-        order.removeAll(pending.toSet())
-        order.addAll(order.indexOf(current) + 1, pending)
-        exoPlayer.setShuffleOrder(DefaultShuffleOrder(order.toIntArray(), Random.nextLong()))
+        return order
     }
+
+    // Streams also need the Wi-Fi lock; local files shouldn't hold it.
+    private fun updateWakeMode() {
+        val hasStream = queueTracks.any { Crossfade.isRemoteStream(it.uri) }
+        exoPlayer.setWakeMode(if (hasStream) C.WAKE_MODE_NETWORK else C.WAKE_MODE_LOCAL)
+    }
+
+    // Player.nextMediaItemIndex treats repeat-one as repeat-off and returns the following item, but
+    // the player will replay the current one, so there is nothing to fade into.
+    private fun fadeTargetIndex(): Int =
+        if (exoPlayer.repeatMode == Player.REPEAT_MODE_ONE) C.INDEX_UNSET else exoPlayer.nextMediaItemIndex
 
     private fun publishQueue() {
         val index = if (queueTracks.isEmpty()) C.INDEX_UNSET else exoPlayer.currentMediaItemIndex
@@ -539,7 +613,6 @@ actual class PlayerEngine(
 
     actual fun setShuffle(enabled: Boolean) {
         exoPlayer.shuffleModeEnabled = enabled
-        applyUpNextShuffleOrder()
         _playbackState.update { it.copy(shuffleEnabled = enabled) }
     }
 
@@ -638,8 +711,8 @@ actual class PlayerEngine(
         }
         val durationMs = exoPlayer.duration.takeIf { it > 0 } ?: return
         val remainingMs = durationMs - exoPlayer.currentPosition
-        val nextIndex = exoPlayer.nextMediaItemIndex
-        val windowMs = Crossfade.windowMs(
+        val nextIndex = fadeTargetIndex()
+        val fullWindowMs = Crossfade.windowMs(
             requestedMs = crossfadeMs,
             outgoing = queueTracks.getOrNull(index),
             outgoingIndex = index,
@@ -647,7 +720,9 @@ actual class PlayerEngine(
             incoming = queueTracks.getOrNull(nextIndex),
             incomingIndex = nextIndex,
         )
-        if (windowMs == 0L || remainingMs > windowMs + Crossfade.PREPARE_LEAD_MS || remainingMs <= windowMs) return
+        if (fullWindowMs == 0L || remainingMs > fullWindowMs + Crossfade.PREPARE_LEAD_MS) return
+        val windowMs = minOf(fullWindowMs, remainingMs - LATE_FADE_LOAD_MS)
+        if (windowMs < minOf(fullWindowMs, MIN_LATE_FADE_MS)) return
 
         val fadePointMs = durationMs - windowMs
         val helper = fadeOutPlayer ?: buildFadeOutPlayer().also { fadeOutPlayer = it }
@@ -679,7 +754,7 @@ actual class PlayerEngine(
     private fun startCrossfade(windowMs: Long) {
         val index = plannedFadeIndex
         val helper = fadeOutPlayer
-        val nextIndex = exoPlayer.nextMediaItemIndex
+        val nextIndex = fadeTargetIndex()
         if (helper == null || index != plannedFadeIndex || index != exoPlayer.currentMediaItemIndex ||
             nextIndex == C.INDEX_UNSET || nextIndex == index
         ) {
